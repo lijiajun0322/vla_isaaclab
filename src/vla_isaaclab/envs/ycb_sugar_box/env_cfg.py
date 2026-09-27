@@ -6,16 +6,19 @@ from pathlib import Path
 import isaaclab.envs.mdp as base_mdp
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
 from ..common import (
     ACTION_JOINT_NAMES,
+    EventsCfg,
     JointLimitActionsCfg,
     LEFT_END_EFFECTOR,
     SUPPORT_HEIGHT,
@@ -45,6 +48,18 @@ SUGAR_BOX_ORIENTATION_WXYZ = (
 SUGAR_BOX_TABLE_YAW_RAD = 0.6251518035481555
 INITIAL_XY = (0.010509244994595768, -0.2904894446620847)
 TARGET_DISPLACEMENT_M = -0.02
+TARGET_MARKER_HEIGHT = SUPPORT_HEIGHT + 0.002
+TARGET_MARKER_ORIENTATION_WXYZ = (
+    math.cos(SUGAR_BOX_TABLE_YAW_RAD / 2),
+    0.0,
+    0.0,
+    math.sin(SUGAR_BOX_TABLE_YAW_RAD / 2),
+)
+# Conservative reset ranges around the calibrated pose, kept inside the
+# left-arm workspace.
+DR_X_RANGE_M = (-0.02, 0.02)
+DR_Y_RANGE_M = (-0.02, 0.02)
+DR_YAW_RANGE_RAD = (-math.radians(8.0), math.radians(8.0))
 TARGET_POSE = (
     INITIAL_XY[0] + TARGET_DISPLACEMENT_M,
     INITIAL_XY[1],
@@ -72,6 +87,9 @@ _SURFACE, _LEG_0, _LEG_1, _LEG_2, _LEG_3 = table_cfgs()
 
 @configclass
 class YCBSugarBoxSceneCfg(InteractiveSceneCfg):
+    # Refresh sensors every physics step so the contact history holds all
+    # substeps of one control step.
+    lazy_sensor_update: bool = False
     ground = ground_cfg()
     dome_light = _DOME_LIGHT
     key_light = _KEY_LIGHT
@@ -85,6 +103,12 @@ class YCBSugarBoxSceneCfg(InteractiveSceneCfg):
     cam_left_high = g1_head_camera_cfg()
     cam_left_wrist = g1_left_wrist_camera_cfg()
     object = _sugar_box_cfg()
+    # Per-link robot/box contact forces for observations, rewards and checks.
+    robot_box_contacts = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        history_length=4,
+    )
     target_marker = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/SugarBoxTarget",
         spawn=sim_utils.CuboidCfg(
@@ -95,13 +119,8 @@ class YCBSugarBoxSceneCfg(InteractiveSceneCfg):
             collision_props=None,
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(INITIAL_XY[0] + TARGET_DISPLACEMENT_M, INITIAL_XY[1], SUPPORT_HEIGHT + 0.002),
-            rot=(
-                math.cos(SUGAR_BOX_TABLE_YAW_RAD / 2),
-                0.0,
-                0.0,
-                math.sin(SUGAR_BOX_TABLE_YAW_RAD / 2),
-            ),
+            pos=(INITIAL_XY[0] + TARGET_DISPLACEMENT_M, INITIAL_XY[1], TARGET_MARKER_HEIGHT),
+            rot=TARGET_MARKER_ORIENTATION_WXYZ,
         ),
     )
 
@@ -180,3 +199,40 @@ class YCBSugarBoxEnvCfg(VLAEnvCfg):
     )
     camera_eye: tuple[float, float, float] = CAMERA_EYE
     camera_target: tuple[float, float, float] = CAMERA_TARGET
+
+
+@configclass
+class DomainRandCommandsCfg:
+    target_pose = mdp.ObjectRelativePoseCommandCfg(
+        world_offset=(TARGET_DISPLACEMENT_M, 0.0, 0.0),
+        object_nominal_quat=SUGAR_BOX_ORIENTATION_WXYZ,
+        marker_prim_name="SugarBoxTarget",
+        marker_height=TARGET_MARKER_HEIGHT,
+        marker_nominal_quat=TARGET_MARKER_ORIENTATION_WXYZ,
+    )
+
+
+@configclass
+class DomainRandEventsCfg(EventsCfg):
+    randomize_sugar_box_pose = EventTerm(
+        func=mdp.randomize_object_planar_pose,
+        mode="reset",
+        params={
+            "x_range": DR_X_RANGE_M,
+            "y_range": DR_Y_RANGE_M,
+            "yaw_range": DR_YAW_RANGE_RAD,
+            "asset_cfg": SceneEntityCfg("object"),
+        },
+    )
+
+
+@configclass
+class YCBSugarBoxDREnvCfg(YCBSugarBoxEnvCfg):
+    """Sugar-box task with a randomized upright tabletop pose per reset."""
+
+    commands: DomainRandCommandsCfg = DomainRandCommandsCfg()
+    events: DomainRandEventsCfg = DomainRandEventsCfg()
+    task_instruction: str = (
+        "Grasp the YCB 004 sugar box from the robot-facing side, move it 2 cm "
+        "toward robot-left, and place it back on the table."
+    )

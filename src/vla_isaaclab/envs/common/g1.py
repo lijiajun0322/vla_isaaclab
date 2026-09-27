@@ -104,7 +104,9 @@ if len(CONTRACT_JOINT_NAMES) != 43:
 LEFT_END_EFFECTOR = "left_hand_palm_link"
 RIGHT_END_EFFECTOR = "right_hand_palm_link"
 LEFT_HAND_OPEN_JOINT_POSITIONS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-LEFT_HAND_CLOSED_JOINT_POSITIONS = (0.2, 0.8, 0.8, 1.2, 1.2, 1.2, 1.2)
+# The left Dex3 middle/index joints flex toward the palm in the negative
+# direction (USD limits [-90, 0] and [-100, 0] degrees).
+LEFT_HAND_CLOSED_JOINT_POSITIONS = (0.2, 0.8, 0.8, -1.2, -1.2, -1.2, -1.2)
 
 LEG_HOME_JOINT_POSITIONS = {
     "left_hip_pitch_joint": -0.05,
