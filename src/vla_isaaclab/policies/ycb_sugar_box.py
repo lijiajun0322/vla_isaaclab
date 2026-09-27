@@ -75,7 +75,7 @@ class YCBSugarBoxScriptedPolicy:
         palm_ids, _ = self.robot.find_bodies([LEFT_END_EFFECTOR], preserve_order=True)
         self.palm_body_id = palm_ids[0]
         self.palm_jacobian_id = self.palm_body_id - 1 if self.robot.is_fixed_base else self.palm_body_id
-        self.max_joint_delta = 0.025
+        self.max_joint_delta = 0.04
         self.max_tracking_error = 0.35
         self.max_waist_yaw_deviation = math.radians(25.0)
         self.ik_gain = 0.15

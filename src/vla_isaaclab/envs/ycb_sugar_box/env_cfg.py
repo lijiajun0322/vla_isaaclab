@@ -55,11 +55,10 @@ TARGET_MARKER_ORIENTATION_WXYZ = (
     0.0,
     math.sin(SUGAR_BOX_TABLE_YAW_RAD / 2),
 )
-# Conservative reset ranges around the calibrated pose, kept inside the
-# left-arm workspace.
+# Reset ranges around the calibrated pose.
 DR_X_RANGE_M = (-0.02, 0.02)
 DR_Y_RANGE_M = (-0.02, 0.02)
-DR_YAW_RANGE_RAD = (-math.radians(8.0), math.radians(8.0))
+DR_YAW_RANGE_RAD = (-math.radians(15.0), math.radians(15.0))
 TARGET_POSE = (
     INITIAL_XY[0] + TARGET_DISPLACEMENT_M,
     INITIAL_XY[1],

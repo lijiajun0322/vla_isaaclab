@@ -7,7 +7,14 @@ from dataclasses import dataclass
 
 import torch
 
-from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul, quat_error_magnitude, quat_slerp
+from isaaclab.utils.math import (
+    quat_apply,
+    quat_conjugate,
+    quat_error_magnitude,
+    quat_from_angle_axis,
+    quat_mul,
+    quat_slerp,
+)
 
 
 
@@ -47,9 +54,9 @@ LIMITS = {
     # clearance move immediately so the arm does not settle toward the box
     # before the first commanded motion.
     "reset": PhaseLimit(0, 0),
-    "move_to_turn_point": PhaseLimit(120, 300),
-    "orient_hand": PhaseLimit(90, 300),
-    "move_pregrasp": PhaseLimit(100, 300),
+    "move_to_turn_point": PhaseLimit(40, 300),
+    "orient_hand": PhaseLimit(30, 300),
+    "move_pregrasp": PhaseLimit(35, 300),
     "approach": PhaseLimit(90, 240),
     "close_gripper": PhaseLimit(120, 120),
     "lift": PhaseLimit(90, 200),
@@ -67,10 +74,17 @@ class SugarBoxPhaseStrategy:
 
     PREGRASP_CLEARANCE_M = 0.0
     TARGET_WORLD_DELTA = (-0.02, 0.0, 0.0)
+    # The world-frame constants below were calibrated for the object's
+    # configured default pose; a reset pose carries them rigidly with the
+    # box's planar offset and world-Z yaw.
     # Offline FK candidate with open-hand clearance and joint-limit margin.
     TURN_POINT_WORLD = (-0.20000000000003018, -0.44859374354722326, 0.8520679715251525)
     GRASP_QUAT_WXYZ = (0.838739529885833, -0.0562443579616566, 0.0882924479819968, 0.5343753520080425)
     GRASP_OFFSET_WORLD = (-0.10779687797449515, -0.11014619853853247, 0.07505996064897658)
+    # Extra horizontal shift across the box's wide face (along its 45 mm
+    # thickness), to the side away from the robot, so the two outer fingers
+    # clear the box.
+    GRASP_AWAY_SHIFT_M = 0.02
 
     def __init__(self, env, robot_definition, object_definition):
         self.env = env
@@ -125,7 +139,10 @@ class SugarBoxPhaseStrategy:
         self.initial_box_pos = self.sugar_box.data.root_pos_w.clone()
         self.pregrasp_pos = None
         self.grasp_pos = None
+        self.grasp_offset = None
         self.grasp_quat = None
+        self.box_yaw_delta = None
+        self.box_yaw_quat = None
         self.travel_quat = None
         self.approach_direction = None
         self.box_top_z = None
@@ -134,19 +151,52 @@ class SugarBoxPhaseStrategy:
             self.env.num_envs, dtype=torch.long, device=self.env.device
         )
 
+    def _measure_box_yaw(self) -> None:
+        # World-Z yaw of the upright box relative to its calibrated default pose.
+        nominal = self.sugar_box.data.default_root_state[:, 3:7]
+        delta = quat_mul(self.sugar_box.data.root_quat_w, quat_conjugate(nominal))
+        x_axis = quat_apply(delta, delta.new_tensor([[1.0, 0.0, 0.0]]).repeat(self.env.num_envs, 1))
+        self.box_yaw_delta = torch.atan2(x_axis[:, 1], x_axis[:, 0])
+        z_axis = delta.new_tensor([[0.0, 0.0, 1.0]]).repeat(self.env.num_envs, 1)
+        self.box_yaw_quat = quat_from_angle_axis(self.box_yaw_delta, z_axis)
+
+    def _box_frame_point(self, calibrated_point) -> torch.Tensor:
+        # Carry a calibrated env-local point rigidly with the box's planar pose.
+        nominal = self.sugar_box.data.default_root_state[:, :3] + self.env.scene.env_origins
+        relative = quat_apply(
+            self.box_yaw_quat, nominal.new_tensor([calibrated_point]) + self.env.scene.env_origins - nominal
+        )
+        pivot = nominal.clone()
+        pivot[:, :2] = self.sugar_box.data.root_pos_w[:, :2]
+        return pivot + relative
+
     def _compute_grasp(self) -> None:
         # Fitted to the upright, yawed box and actual three-finger pad sweeps.
         # Keep the reachable wrist tilt rather than forcing a level palm.
-        self.grasp_quat = self.sugar_box.data.root_pos_w.new_tensor(
-            [self.GRASP_QUAT_WXYZ]
-        ).repeat(self.env.num_envs, 1)
+        self._measure_box_yaw()
+        self.grasp_quat = quat_mul(
+            self.box_yaw_quat,
+            self.sugar_box.data.root_pos_w.new_tensor([self.GRASP_QUAT_WXYZ]).repeat(self.env.num_envs, 1),
+        )
         self.travel_quat = self.grasp_quat.clone()
         self.approach_direction = quat_apply(
             self.grasp_quat, self.grasp_quat.new_tensor([[1.0, 0.0, 0.0]]).repeat(self.env.num_envs, 1)
         )
-        self.grasp_pos = self.sugar_box.data.root_pos_w + self.sugar_box.data.root_pos_w.new_tensor(
-            [self.GRASP_OFFSET_WORLD]
+        thickness_axis = quat_apply(
+            self.sugar_box.data.root_quat_w,
+            self.grasp_quat.new_tensor([[0.0, 0.0, 1.0]]).repeat(self.env.num_envs, 1),
         )
+        thickness_axis[:, 2] = 0.0
+        thickness_axis = thickness_axis / torch.linalg.vector_norm(thickness_axis, dim=-1, keepdim=True)
+        away = self.sugar_box.data.root_pos_w - self.robot.data.root_pos_w
+        away_axis = torch.where(
+            (thickness_axis * away).sum(-1, keepdim=True) < 0.0, -thickness_axis, thickness_axis
+        )
+        self.grasp_offset = quat_apply(
+            self.box_yaw_quat,
+            self.grasp_quat.new_tensor([self.GRASP_OFFSET_WORLD]).repeat(self.env.num_envs, 1),
+        ) + self.GRASP_AWAY_SHIFT_M * away_axis
+        self.grasp_pos = self.sugar_box.data.root_pos_w + self.grasp_offset
         self.pregrasp_pos = self.grasp_pos.clone()
         self.box_top_z = self.sugar_box.data.root_pos_w[:, 2] + 0.5 * self.sugar_box_height_m
         self.grasp_depth_below_box_top_m = None
@@ -242,7 +292,7 @@ class SugarBoxPhaseStrategy:
         if self.phase == "reset" and timed_out:
             self._compute_grasp()
             palm_pos, palm_quat = self._palm_pose()
-            turn_point = palm_pos.new_tensor([self.TURN_POINT_WORLD]) + self.env.scene.env_origins
+            turn_point = self._box_frame_point(self.TURN_POINT_WORLD)
             self._set_phase("move_to_turn_point", turn_point, palm_quat, 0.0)
         elif self.phase == "move_to_turn_point":
             self._advance_if_ready("orient_hand", self.target_pos, self.grasp_quat, 0.0)
@@ -255,9 +305,7 @@ class SugarBoxPhaseStrategy:
             if (self.phase_step >= LIMITS[self.phase].minimum_steps
                     and self.orientation_ready_steps >= 10):
                 # Account for initial physical settling before the final approach.
-                self.grasp_pos = self.sugar_box.data.root_pos_w + self.sugar_box.data.root_pos_w.new_tensor(
-                    [self.GRASP_OFFSET_WORLD]
-                )
+                self.grasp_pos = self.sugar_box.data.root_pos_w + self.grasp_offset
                 self.pregrasp_pos = self.grasp_pos.clone()
                 self._set_phase("move_pregrasp", self.pregrasp_pos, self.grasp_quat, 0.0)
             elif timed_out:
@@ -414,6 +462,11 @@ class SugarBoxPhaseStrategy:
             "turn_point_world_m": list(self.TURN_POINT_WORLD),
             "grasp_quat_wxyz": list(self.GRASP_QUAT_WXYZ),
             "grasp_offset_world_m": list(self.GRASP_OFFSET_WORLD),
+            "grasp_away_shift_m": self.GRASP_AWAY_SHIFT_M,
+            "box_yaw_delta_rad": None if self.box_yaw_delta is None else self.box_yaw_delta[0].item(),
+            "applied_grasp_quat_wxyz": None
+            if self.grasp_quat is None
+            else self.grasp_quat[0].detach().cpu().tolist(),
             "left_hand_joint_names": list(self.definition.left_hand_joint_names),
             "approach_direction_world": None
             if self.approach_direction is None
