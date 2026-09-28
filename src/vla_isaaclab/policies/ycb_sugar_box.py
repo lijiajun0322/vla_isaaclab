@@ -14,6 +14,7 @@ from vla_isaaclab.envs.common import (
     LEFT_HAND_CLOSED_JOINT_POSITIONS,
     LEFT_HAND_JOINT_NAMES,
     LEFT_HAND_OPEN_JOINT_POSITIONS,
+    SUGAR_BOX,
     WAIST_JOINT_NAMES,
 )
 from .bounded_ik import bounded_dls
@@ -30,17 +31,13 @@ class _G1Semantics:
     left_hand_closed_joint_positions = LEFT_HAND_CLOSED_JOINT_POSITIONS
 
 
-class _SugarBoxSemantics:
-    metadata = {"sugar_box_dimensions_m": [0.092, 0.045, 0.176]}
-
-
 class YCBSugarBoxScriptedPolicy:
     """Own task phases, bounded IK, hand targets, and action normalization."""
 
     def __init__(self, env):
         self.env = env
         self.robot = env.scene["robot"]
-        self.strategy = SugarBoxPhaseStrategy(env, _G1Semantics, _SugarBoxSemantics)
+        self.strategy = SugarBoxPhaseStrategy(env, _G1Semantics, SUGAR_BOX)
         _, self.joint_names, self.action_joint_ids = resolved_action_joints(env)
         self.name_to_action_index = {name: index for index, name in enumerate(self.joint_names)}
 

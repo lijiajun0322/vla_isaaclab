@@ -74,21 +74,13 @@ class SugarBoxPhaseStrategy:
 
     PREGRASP_CLEARANCE_M = 0.0
     TARGET_WORLD_DELTA = (-0.02, 0.0, 0.0)
-    # The world-frame constants below were calibrated for the object's
-    # configured default pose; a reset pose carries them rigidly with the
-    # box's planar offset and world-Z yaw.
-    # Offline FK candidate with open-hand clearance and joint-limit margin.
-    TURN_POINT_WORLD = (-0.20000000000003018, -0.44859374354722326, 0.8520679715251525)
-    GRASP_QUAT_WXYZ = (0.838739529885833, -0.0562443579616566, 0.0882924479819968, 0.5343753520080425)
-    GRASP_OFFSET_WORLD = (-0.10779687797449515, -0.11014619853853247, 0.07505996064897658)
-    # Extra horizontal shift across the box's wide face (along its 45 mm
-    # thickness), to the side away from the robot, so the two outer fingers
-    # clear the box.
-    GRASP_AWAY_SHIFT_M = 0.02
 
-    def __init__(self, env, robot_definition, object_definition):
+    def __init__(self, env, robot_definition, object_spec):
         self.env = env
         self.definition = robot_definition
+        # Calibrated approach (turn point, grasp orientation and offset) and axes;
+        # see GraspObjectSpec.
+        self.spec = object_spec
         self.robot = env.scene["robot"]
         self.sugar_box = env.scene["object"]
         palm_ids, _ = self.robot.find_bodies(
@@ -98,9 +90,7 @@ class SugarBoxPhaseStrategy:
         self.hand_joint_ids, _ = self.robot.find_joints(
             list(robot_definition.left_hand_joint_names), preserve_order=True
         )
-        self.sugar_box_height_m = float(
-            object_definition.metadata["sugar_box_dimensions_m"][2]
-        )
+        self.sugar_box_height_m = 2.0 * object_spec.half_extents_m[object_spec.up_axis]
         self.reset()
 
     @property
@@ -176,15 +166,17 @@ class SugarBoxPhaseStrategy:
         self._measure_box_yaw()
         self.grasp_quat = quat_mul(
             self.box_yaw_quat,
-            self.sugar_box.data.root_pos_w.new_tensor([self.GRASP_QUAT_WXYZ]).repeat(self.env.num_envs, 1),
+            self.sugar_box.data.root_pos_w.new_tensor([self.spec.grasp_quat_wxyz]).repeat(self.env.num_envs, 1),
         )
         self.travel_quat = self.grasp_quat.clone()
         self.approach_direction = quat_apply(
             self.grasp_quat, self.grasp_quat.new_tensor([[1.0, 0.0, 0.0]]).repeat(self.env.num_envs, 1)
         )
+        pinch = [0.0, 0.0, 0.0]
+        pinch[self.spec.pinch_axis] = 1.0
         thickness_axis = quat_apply(
             self.sugar_box.data.root_quat_w,
-            self.grasp_quat.new_tensor([[0.0, 0.0, 1.0]]).repeat(self.env.num_envs, 1),
+            self.grasp_quat.new_tensor([pinch]).repeat(self.env.num_envs, 1),
         )
         thickness_axis[:, 2] = 0.0
         thickness_axis = thickness_axis / torch.linalg.vector_norm(thickness_axis, dim=-1, keepdim=True)
@@ -194,8 +186,8 @@ class SugarBoxPhaseStrategy:
         )
         self.grasp_offset = quat_apply(
             self.box_yaw_quat,
-            self.grasp_quat.new_tensor([self.GRASP_OFFSET_WORLD]).repeat(self.env.num_envs, 1),
-        ) + self.GRASP_AWAY_SHIFT_M * away_axis
+            self.grasp_quat.new_tensor([self.spec.grasp_offset_world]).repeat(self.env.num_envs, 1),
+        ) + self.spec.grasp_away_shift_m * away_axis
         self.grasp_pos = self.sugar_box.data.root_pos_w + self.grasp_offset
         self.pregrasp_pos = self.grasp_pos.clone()
         self.box_top_z = self.sugar_box.data.root_pos_w[:, 2] + 0.5 * self.sugar_box_height_m
@@ -273,8 +265,13 @@ class SugarBoxPhaseStrategy:
         return (box_pos + quat_apply(rotation, palm_pos - self.sugar_box.data.root_pos_w),
                 quat_mul(rotation, palm_quat))
 
+    def _up_axis_local(self) -> torch.Tensor:
+        up = self.target_pos.new_zeros(self.env.num_envs, 3)
+        up[:, self.spec.up_axis] = self.spec.up_sign
+        return up
+
     def _box_tilt(self):
-        up = self.target_pos.new_tensor([[0.0, 1.0, 0.0]]).repeat(self.env.num_envs, 1)
+        up = self._up_axis_local()
         axis = quat_apply(self.sugar_box.data.root_quat_w, up)
         return torch.acos(axis[:, 2].clamp(-1.0, 1.0))
 
@@ -292,7 +289,7 @@ class SugarBoxPhaseStrategy:
         if self.phase == "reset" and timed_out:
             self._compute_grasp()
             palm_pos, palm_quat = self._palm_pose()
-            turn_point = self._box_frame_point(self.TURN_POINT_WORLD)
+            turn_point = self._box_frame_point(self.spec.turn_point_world)
             self._set_phase("move_to_turn_point", turn_point, palm_quat, 0.0)
         elif self.phase == "move_to_turn_point":
             self._advance_if_ready("orient_hand", self.target_pos, self.grasp_quat, 0.0)
@@ -359,7 +356,7 @@ class SugarBoxPhaseStrategy:
             # its bottom with minimum wrist rotation, retaining tabletop yaw.
             box_quat = self.sugar_box.data.root_quat_w
             up = self.target_pos.new_tensor([[0.0, 0.0, 1.0]]).repeat(self.env.num_envs, 1)
-            axis = quat_apply(box_quat, up.roll(-1, dims=1))
+            axis = quat_apply(box_quat, self._up_axis_local())
             correction = torch.cat((1.0 + (axis * up).sum(-1, keepdim=True),
                                     torch.linalg.cross(axis, up)), dim=-1)
             correction = correction / torch.linalg.vector_norm(correction, dim=-1, keepdim=True).clamp_min(1e-6)
@@ -459,10 +456,10 @@ class SugarBoxPhaseStrategy:
             if self.grasp_depth_below_box_top_m is None
             else self.grasp_depth_below_box_top_m[0].item(),
             "pregrasp_clearance_m": self.PREGRASP_CLEARANCE_M,
-            "turn_point_world_m": list(self.TURN_POINT_WORLD),
-            "grasp_quat_wxyz": list(self.GRASP_QUAT_WXYZ),
-            "grasp_offset_world_m": list(self.GRASP_OFFSET_WORLD),
-            "grasp_away_shift_m": self.GRASP_AWAY_SHIFT_M,
+            "turn_point_world_m": list(self.spec.turn_point_world),
+            "grasp_quat_wxyz": list(self.spec.grasp_quat_wxyz),
+            "grasp_offset_world_m": list(self.spec.grasp_offset_world),
+            "grasp_away_shift_m": self.spec.grasp_away_shift_m,
             "box_yaw_delta_rad": None if self.box_yaw_delta is None else self.box_yaw_delta[0].item(),
             "applied_grasp_quat_wxyz": None
             if self.grasp_quat is None

@@ -1,14 +1,14 @@
-"""Sugar-box reset randomization terms."""
+"""Object-agnostic tabletop reset and termination terms."""
 
 import torch
 
-from isaaclab.assets import RigidObject
-from isaaclab.envs import ManagerBasedEnv
+from isaaclab.assets import Articulation, RigidObject
+from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_from_angle_axis, quat_mul, sample_uniform
 
 
-POSE_OFFSET_ATTR = "sugar_box_pose_offset"
+POSE_OFFSET_ATTR = "object_pose_offset"
 
 
 def randomize_object_planar_pose(
@@ -22,7 +22,7 @@ def randomize_object_planar_pose(
     """Offset the default object pose on the tabletop and yaw it about world +Z.
 
     Isaac Lab's ``reset_root_state_uniform`` composes yaw in the object's body
-    frame, which tips over a box whose height axis is not local +Z.
+    frame, which tips over an object whose up axis is not local +Z.
     """
     obj: RigidObject = env.scene[asset_cfg.name]
     ranges = torch.tensor((x_range, y_range, yaw_range), dtype=torch.float32, device=obj.device)
@@ -50,3 +50,17 @@ def object_pose_offset(env: ManagerBasedEnv, env_index: int = 0) -> dict | None:
         return None
     x, y, yaw = offsets[env_index].detach().cpu().tolist()
     return {"x_m": x, "y_m": y, "yaw_rad": yaw}
+
+
+def object_fallen(env: ManagerBasedRLEnv, support_height: float) -> torch.Tensor:
+    obj: RigidObject = env.scene["object"]
+    return obj.data.root_pos_w[:, 2] < support_height - 0.05
+
+
+def invalid_state(env: ManagerBasedRLEnv) -> torch.Tensor:
+    robot: Articulation = env.scene["robot"]
+    obj: RigidObject = env.scene["object"]
+    return ~(
+        torch.isfinite(robot.data.joint_pos).all(dim=-1)
+        & torch.isfinite(obj.data.root_state_w).all(dim=-1)
+    )

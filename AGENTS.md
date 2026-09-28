@@ -46,12 +46,16 @@ Gym ID -> EnvCfg -> Scene + Isaac Lab Managers -> normalized action -> robot
                optional scripted policy
 ```
 
-- `envs/common/`: reusable G1 and physical scene/config helpers.
+- `envs/common/`: reusable G1 and physical scene/config helpers, plus
+  `objects.py`: one `GraspObjectSpec` per graspable object (see below).
 - `envs/<task>/env_cfg.py`: concrete robot, object, camera, action and managers.
 - `envs/<task>/mdp/`: command, observation, reward, event and termination terms.
 - `policies/`: optional scripted strategy and action generation.
 - `recording/`: HDF5 staging and contract-aligned LeRobot v3/v2.1 export; v3 is default.
-- `rl/`: RL support such as the sugar-box pregrasp state table and its reset event.
+- `envs/ycb_grasp/`: object-generic grasp-and-lift RL task, one Gym ID per
+  object (`VLA-YCBGraspLift-<Object>-G1-v0`), plus a `-Fast-v0` variant with
+  5x speed limits for training from scratch before the slow fine-tune.
+- `rl/`: RL support such as the per-object pregrasp state table and its reset event.
 
 Use Isaac Lab `JointPositionToLimitsActionCfg` for the 43-D normalized action.
 Its mapping is `-1=soft lower limit`, `0=midpoint`, `+1=soft upper limit`.
@@ -69,9 +73,16 @@ space built only from Isaac Lab's own action terms, e.g.
 ActionTerm, and the 43-D environments and data contract stay unchanged. Data
 recorded from RL policies for VLA training uses the 43-D absolute joint targets.
 
-Object and task-specific configs stay in their concrete environment. Do not
-recreate top-level `robots/`, `objects/`, `worlds/`, `sensors/`, `controllers/`,
-or `experts/` component layers.
+Task-specific configs stay in their concrete environment. Do not recreate
+top-level `robots/`, `objects/`, `worlds/`, `sensors/`, `controllers/`, or
+`experts/` component layers.
+
+Exception: per-object parameters used by more than one environment (asset,
+collider size and axes, rest pose, reset randomization, calibrated scripted
+approach, finger preshape) live in one `GraspObjectSpec` in
+`envs/common/objects.py`. Environments, scripted policies and RL code read the
+spec instead of redefining those values. Task-level values (goal offsets,
+success thresholds, phase timing) stay in the concrete environment or policy.
 
 Camera placement is owned by the concrete scene EnvCfg. Shared intrinsics and
 modalities are owned by `envs/common/scene.py`.
@@ -90,12 +101,14 @@ modalities are owned by `envs/common/scene.py`.
   collider without re-validating the scripted grasp.
 - A filtered `ContactSensorCfg` only reports for one sensor body per env. For
   per-link object contact, use one sensor per link (see
-  `YCBSugarBoxStateSceneCfg`); the DR scene's `robot_box_contacts` spans every
+  `YCBGraspStateSceneCfg`); the DR scene's `robot_box_contacts` spans every
   robot link and reports zero.
-- RL pregrasp table: `./scripts/rl/build_pregrasp_table.sh --headless` writes
-  `outputs/rl/pregrasp_table_preshape.{pt,json,png}` (~1 min for 10k states at
-  1024 envs) with the fingers at the safe preshape `DEFAULT_HAND_PRESHAPE`;
-  `--open-hand --output outputs/rl/pregrasp_table.pt` rebuilds the open-hand table.
+- RL pregrasp table: `./scripts/rl/build_pregrasp_table.sh --headless
+  [--task VLA-YCBGraspLift-<Object>-G1-v0]` writes
+  `outputs/rl/<object>/pregrasp_table_preshape.{pt,json,png}` (~1 min for 10k
+  states at 1024 envs) with the fingers at the spec's `hand_preshape`;
+  `--open-hand` writes `pregrasp_table_open.*` instead. A table records its
+  object and refuses to load into another object's env.
 
 Useful commands:
 

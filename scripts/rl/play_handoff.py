@@ -36,7 +36,7 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--task", default="VLA-YCBSugarBox-G1-GraspLift-RL-v1")
+parser.add_argument("--task", default="VLA-YCBGraspLift-SugarBox-G1-v0")
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--num-envs", type=int, default=256)
 parser.add_argument("--seed", type=int, default=7)
@@ -71,16 +71,13 @@ from vla_isaaclab.envs.common import (
     LEFT_HAND_CLOSED_JOINT_POSITIONS,
     LEFT_HAND_JOINT_NAMES,
     LEFT_HAND_OPEN_JOINT_POSITIONS,
-    camera_cfg,
-    g1_left_wrist_camera_cfg,
 )
-from vla_isaaclab.envs.ycb_sugar_box.env_cfg import CAMERA_EYE, CAMERA_TARGET
-from vla_isaaclab.envs.ycb_sugar_box.mdp import grasp_rl
+from vla_isaaclab.envs.ycb_grasp.env_cfg import VIDEO_CAMERAS, add_video_cameras
+from vla_isaaclab.envs.ycb_grasp.mdp import grasp_rl
 from vla_isaaclab.policies.ycb_sugar_box_strategy import SugarBoxPhaseStrategy
 from vla_isaaclab.rl.action_clip import ClippedRslRlVecEnvWrapper
 
 
-VIDEO_CAMERAS = ("cam_side", "cam_left_wrist")
 RL, HOLD, MOVE, LOWER, RELEASE, RETREAT, CHECK = range(7)
 PHASE_NAMES = ("rl", "hold", "move", "lower", "release", "retreat", "check")
 RETREAT_BACK_M, RETREAT_UP_M = 0.08, 0.06
@@ -146,8 +143,7 @@ def main() -> int:
     env_cfg.terminations.lifted_off_pose = None
     env_cfg.episode_length_s = 4.0 + sum(DURATION_S.values())
     if RECORD:
-        env_cfg.scene.cam_side = camera_cfg(CAMERA_EYE, CAMERA_TARGET)
-        env_cfg.scene.cam_left_wrist = g1_left_wrist_camera_cfg()
+        add_video_cameras(env_cfg)
     agent_cfg = load_cfg_from_registry(ARGS.task, "rsl_rl_cfg_entry_point")
     agent_cfg.device = ARGS.device
     env = ClippedRslRlVecEnvWrapper(gym.make(ARGS.task, cfg=env_cfg))
@@ -197,7 +193,7 @@ def main() -> int:
         with torch.inference_mode():
             base.reset()
             obs, _ = env.get_observations()
-            start_w[:] = base.grasp_box_start_pos
+            start_w[:] = base.grasp_object_start_pos
             target_w[:] = start_w + delta
             root_inv = quat_conjugate(robot.data.root_quat_w)
             total = round(env_cfg.episode_length_s / dt) - 2
@@ -236,7 +232,7 @@ def main() -> int:
 
                 # Phase transitions.
                 phase_step += scripted.long()
-                fired, _ = grasp_rl._held_lift_event(base, 0.05)
+                fired, _ = grasp_rl.held_lift_event(base, 0.05)
                 new = (phase == RL) & fired
                 lifted |= new
                 lift_step[new] = step
@@ -264,10 +260,10 @@ def main() -> int:
             box_pos = box.data.root_pos_w
             xy_error = torch.linalg.vector_norm(box_pos[:, :2] - target_w[:, :2], dim=-1)
             height_error = (box_pos[:, 2] - target_w[:, 2]).abs()
-            tilt = torch.rad2deg(grasp_rl.box_tilt(base))
+            tilt = torch.rad2deg(grasp_rl.object_tilt(base))
             done = phase == CHECK
             q = lambda x: None if not bool(done.any()) else {k: round(x[done].quantile(k).item(), 4) for k in (0.1, 0.5, 0.9)}
-            from vla_isaaclab.envs.ycb_sugar_box.mdp.events import POSE_OFFSET_ATTR
+            from vla_isaaclab.envs.common.mdp import POSE_OFFSET_ATTR
 
             offset = getattr(base, POSE_OFFSET_ATTR)[0]
             final = {

@@ -60,13 +60,16 @@ def light_cfgs() -> tuple[AssetBaseCfg, AssetBaseCfg]:
     return dome, key
 
 
-def table_cfgs() -> tuple[AssetBaseCfg, AssetBaseCfg, AssetBaseCfg, AssetBaseCfg, AssetBaseCfg]:
+def table_cfgs(
+    support_height: float = SUPPORT_HEIGHT,
+) -> tuple[AssetBaseCfg, AssetBaseCfg, AssetBaseCfg, AssetBaseCfg, AssetBaseCfg]:
+    """Table top (at support_height) and four legs."""
     surface = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/SupportSurface",
         spawn=_static_box((1.2, 0.8, 0.05)),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, SUPPORT_HEIGHT - 0.025)),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, support_height - 0.025)),
     )
-    leg_height = SUPPORT_HEIGHT - 0.05
+    leg_height = support_height - 0.05
     legs = tuple(
         AssetBaseCfg(
             prim_path=f"{{ENV_REGEX_NS}}/SupportLeg_{index}",

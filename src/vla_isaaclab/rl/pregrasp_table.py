@@ -1,7 +1,7 @@
-"""Analytic sugar-box pregrasp states: generation checks and table resets for RL.
+"""Analytic pregrasp states for one YCB object: generation checks and table resets for RL.
 
-The scripted policy's pregrasp palm pose is a closed-form function of the box's
-planar pose. Instead of simulating the approach, the arm is solved kinematically
+The scripted policy's pregrasp palm pose is a closed-form function of the
+object's planar pose and its calibrated ``GraspObjectSpec``. Instead of simulating the approach, the arm is solved kinematically
 onto that pose, the robot and box are written into the simulator, and a short
 static hold checks that nothing collides. Accepted states are stored in a table
 that RL resets sample from.
@@ -28,22 +28,27 @@ from vla_isaaclab.envs.common import (
     LEFT_END_EFFECTOR,
     LEFT_HAND_CLOSED_JOINT_POSITIONS,
     LEFT_HAND_JOINT_NAMES,
+    PROJECT_ROOT,
     WAIST_JOINT_NAMES,
+    GraspObjectSpec,
+    object_up_axis,
 )
-from vla_isaaclab.envs.ycb_sugar_box.mdp.events import POSE_OFFSET_ATTR
+from vla_isaaclab.envs.common.mdp import POSE_OFFSET_ATTR
 from vla_isaaclab.policies.bounded_ik import bounded_dls
-from vla_isaaclab.policies.ycb_sugar_box_strategy import SugarBoxPhaseStrategy
 
 
 # Same IK joints and waist bound as the scripted policy.
 ARM_JOINT_NAMES = (WAIST_JOINT_NAMES[0], *LEFT_ARM_JOINT_NAMES)
 MAX_WAIST_YAW_DEVIATION_RAD = math.radians(25.0)
 FINGERTIP_BODY_NAMES = ("left_hand_thumb_2_link", "left_hand_index_1_link", "left_hand_middle_1_link")
-TABLE_FORMAT_VERSION = 2
-# Safe finger preshape (rad magnitudes): thumb base rotation, then how far the
-# thumb, index and middle curl toward their closed pose. Chosen from a 1024-env
-# scan so the fingers stop short of the box in nearly every pregrasp state.
-DEFAULT_HAND_PRESHAPE = {"thumb_rotate": 0.2, "thumb": 0.6, "index": 0.2, "middle": 0.25}
+# 3: adds object_name, checked against the env's object_spec on load.
+TABLE_FORMAT_VERSION = 3
+PREGRASP_TABLE_DIR = PROJECT_ROOT / "outputs/rl"
+
+
+def pregrasp_table_path(spec: GraspObjectSpec, open_hand: bool = False) -> Path:
+    """outputs/rl/<object>/pregrasp_table_{preshape,open}.pt"""
+    return PREGRASP_TABLE_DIR / spec.name / f"pregrasp_table_{'open' if open_hand else 'preshape'}.pt"
 
 
 def hand_preshape_joint_pos(thumb_rotate: float, thumb: float, index: float, middle: float) -> dict[str, float]:
@@ -64,44 +69,39 @@ def _axis(reference: torch.Tensor, index: int) -> torch.Tensor:
 
 
 def box_yaw_quat(box_quat: torch.Tensor, nominal_quat: torch.Tensor) -> torch.Tensor:
-    """World-Z yaw of the upright box relative to its calibrated default pose."""
+    """World-Z yaw of the upright object relative to its calibrated default pose."""
     delta = quat_mul(box_quat, quat_conjugate(nominal_quat))
     x_axis = quat_apply(delta, _axis(box_quat, 0))
     yaw = torch.atan2(x_axis[:, 1], x_axis[:, 0])
     return quat_from_angle_axis(yaw, _axis(box_quat, 2))
 
 
-def box_up_axis(box_quat: torch.Tensor) -> torch.Tensor:
-    # The box height is its local +Y axis.
-    return quat_apply(box_quat, _axis(box_quat, 1))
-
-
-def turn_point(box_pos, box_quat, nominal_pos, nominal_quat, env_origins) -> torch.Tensor:
-    """Scripted turn point carried rigidly with the box's planar pose (world frame)."""
+def turn_point(spec: GraspObjectSpec, box_pos, box_quat, nominal_pos, nominal_quat, env_origins) -> torch.Tensor:
+    """Scripted turn point carried rigidly with the object's planar pose (world frame)."""
     yaw_quat = box_yaw_quat(box_quat, nominal_quat)
-    # TURN_POINT_WORLD is env-local; nominal_pos and the result are world frame.
-    point = env_origins + nominal_pos.new_tensor(SugarBoxPhaseStrategy.TURN_POINT_WORLD)
+    # turn_point_world is env-local; nominal_pos and the result are world frame.
+    point = env_origins + nominal_pos.new_tensor(spec.turn_point_world)
     pivot = nominal_pos.clone()
     pivot[:, :2] = box_pos[:, :2]
     return pivot + quat_apply(yaw_quat, point - nominal_pos)
 
 
-def pregrasp_palm_target(box_pos, box_quat, nominal_quat, robot_root_pos, backoff_m):
+def pregrasp_palm_target(spec: GraspObjectSpec, box_pos, box_quat, nominal_quat, robot_root_pos, backoff_m):
     """Replicate SugarBoxPhaseStrategy._compute_grasp, pulled back along the approach.
 
     Returns world-frame palm position, palm orientation (wxyz) and the unit
     approach direction.
     """
     yaw_quat = box_yaw_quat(box_quat, nominal_quat)
-    grasp_quat = quat_mul(yaw_quat, box_quat.new_tensor(SugarBoxPhaseStrategy.GRASP_QUAT_WXYZ).expand_as(box_quat))
+    grasp_quat = quat_mul(yaw_quat, box_quat.new_tensor(spec.grasp_quat_wxyz).expand_as(box_quat))
     approach = quat_apply(grasp_quat, _axis(box_quat, 0))
-    thickness_axis = quat_apply(box_quat, _axis(box_quat, 2))
+    thickness_axis = quat_apply(box_quat, _axis(box_quat, spec.pinch_axis))
     thickness_axis[:, 2] = 0.0
     thickness_axis = thickness_axis / torch.linalg.vector_norm(thickness_axis, dim=-1, keepdim=True)
     away = box_pos - robot_root_pos
     away_axis = torch.where((thickness_axis * away).sum(-1, keepdim=True) < 0.0, -thickness_axis, thickness_axis)
-    offset = quat_apply(yaw_quat, box_pos.new_tensor(SugarBoxPhaseStrategy.GRASP_OFFSET_WORLD).expand_as(box_pos))
-    offset = offset + SugarBoxPhaseStrategy.GRASP_AWAY_SHIFT_M * away_axis
+    offset = quat_apply(yaw_quat, box_pos.new_tensor(spec.grasp_offset_world).expand_as(box_pos))
+    offset = offset + spec.grasp_away_shift_m * away_axis
     position = box_pos + offset - backoff_m.unsqueeze(-1) * approach
     return position, grasp_quat, approach
 
@@ -202,19 +202,19 @@ class ArmKinematics:
         }
 
 
-BOX_CONTACT_SENSOR_PREFIX = "box_contact_"
+OBJECT_CONTACT_SENSOR_PREFIX = "object_contact_"
 ARM_CONTACT_SENSOR = "left_arm_contacts"
 
 
 def hand_box_contact_forces(env) -> torch.Tensor:
-    """Per-link hand/box contact force magnitudes, shape (num_envs, num_links)."""
+    """Per-link hand/object contact force magnitudes, shape (num_envs, num_links)."""
     forces = [
         torch.linalg.vector_norm(sensor.data.force_matrix_w, dim=-1).amax(dim=(1, 2))
         for name, sensor in env.scene.sensors.items()
-        if name.startswith(BOX_CONTACT_SENSOR_PREFIX)
+        if name.startswith(OBJECT_CONTACT_SENSOR_PREFIX)
     ]
     if not forces:
-        raise RuntimeError(f"Scene has no '{BOX_CONTACT_SENSOR_PREFIX}*' contact sensors")
+        raise RuntimeError(f"Scene has no '{OBJECT_CONTACT_SENSOR_PREFIX}*' contact sensors")
     return torch.stack(forces, dim=-1)
 
 
@@ -252,8 +252,9 @@ def settle_check(env, kinematics: ArmKinematics, arm_q, box_pose_w, palm_target_
         max_arm_force = torch.maximum(max_arm_force, arm_force)
 
     box_pos, box_quat = box.data.root_pos_w, box.data.root_quat_w
-    up_start = box_up_axis(box_pose_w[:, 3:7])
-    up_end = box_up_axis(box_quat)
+    spec = env.cfg.object_spec
+    up_start = object_up_axis(spec, box_pose_w[:, 3:7])
+    up_end = object_up_axis(spec, box_quat)
     palm_pos = robot.data.body_pos_w[:, kinematics.palm_body_id]
     palm_quat = robot.data.body_quat_w[:, kinematics.palm_body_id]
     palm_pos_err, palm_rot_err = compute_pose_error(
@@ -275,8 +276,8 @@ def settle_check(env, kinematics: ArmKinematics, arm_q, box_pose_w, palm_target_
         "arm_contact_force_n": max_arm_force,
         "settled_palm_position_error_m": torch.linalg.vector_norm(palm_pos_err, dim=-1),
         "settled_palm_rotation_error_rad": torch.linalg.vector_norm(palm_rot_err, dim=-1),
-        # Box-frame fingertip positions (x width, y height, z thickness), in order
-        # thumb, index, middle; used to judge whether the open hand straddles the box.
+        # Object-frame fingertip positions, in order thumb, index, middle; used to
+        # judge whether the open hand straddles the object.
         "fingertips_in_box_m": tips_in_box.reshape(env.num_envs, -1),
     }
     box_state = box.data.root_state_w.clone()
@@ -293,6 +294,7 @@ class PregraspTable:
     box_state: torch.Tensor  # env-local root state (pos, quat wxyz, lin vel, ang vel)
     box_offset: torch.Tensor  # (x m, y m, yaw rad) relative to the calibrated pose
     backoff_m: torch.Tensor
+    object_name: str
     meta: dict
 
     def __len__(self) -> int:
@@ -314,12 +316,13 @@ def load_pregrasp_table(path: str | Path, device, valid_only: bool = True) -> Pr
         box_state=data["box_state"][rows],
         box_offset=data["box_offset"][rows],
         backoff_m=data["backoff_m"][rows],
+        object_name=data["object_name"],
         meta=data["meta"],
     )
 
 
 def reset_from_pregrasp_table(env, env_ids: torch.Tensor, table_path: str):
-    """Reset event: place robot and box at randomly drawn accepted pregrasp states."""
+    """Reset event: place robot and object at randomly drawn accepted pregrasp states."""
     table: PregraspTable | None = getattr(env, "pregrasp_table", None)
     robot = env.scene["robot"]
     box = env.scene["object"]
@@ -327,6 +330,9 @@ def reset_from_pregrasp_table(env, env_ids: torch.Tensor, table_path: str):
         table = load_pregrasp_table(table_path, env.device)
         if table.joint_names != list(robot.joint_names):
             raise RuntimeError("Pregrasp table joint order does not match the robot articulation")
+        if table.object_name != env.cfg.object_spec.name:
+            raise RuntimeError(f"Pregrasp table {table_path} is for {table.object_name}, "
+                               f"not {env.cfg.object_spec.name}")
         env.pregrasp_table = table
         env.pregrasp_table_index = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     if env_ids is None:
@@ -339,16 +345,14 @@ def reset_from_pregrasp_table(env, env_ids: torch.Tensor, table_path: str):
     box_state[:, :3] += env.scene.env_origins[env_ids]
     box.write_root_state_to_sim(box_state, env_ids=env_ids)
     env.pregrasp_table_index[env_ids] = rows
-    # Start pose for lift/tilt/push measurements in the grasp RL terms.
-    if getattr(env, "grasp_box_start_pos", None) is None:
-        env.grasp_box_start_pos = torch.zeros(env.num_envs, 3, device=env.device)
-        env.grasp_box_start_up = torch.zeros(env.num_envs, 3, device=env.device)
-        env.grasp_box_start_quat = torch.zeros(env.num_envs, 4, device=env.device)
-        env.grasp_max_lift = torch.zeros(env.num_envs, device=env.device)
-    env.grasp_box_start_pos[env_ids] = box_state[:, :3]
-    env.grasp_box_start_quat[env_ids] = box_state[:, 3:7]
-    env.grasp_box_start_up[env_ids] = box_up_axis(box_state[:, 3:7])
-    env.grasp_max_lift[env_ids] = 0.0
+    # Start pose for the lift and tilt measurements in the grasp RL terms.
+    if getattr(env, "grasp_object_start_pos", None) is None:
+        env.grasp_object_start_pos = torch.zeros(env.num_envs, 3, device=env.device)
+        env.grasp_object_start_up = torch.zeros(env.num_envs, 3, device=env.device)
+        env.grasp_object_start_quat = torch.zeros(env.num_envs, 4, device=env.device)
+    env.grasp_object_start_pos[env_ids] = box_state[:, :3]
+    env.grasp_object_start_quat[env_ids] = box_state[:, 3:7]
+    env.grasp_object_start_up[env_ids] = object_up_axis(env.cfg.object_spec, box_state[:, 3:7])
     offsets = getattr(env, POSE_OFFSET_ATTR, None)
     if offsets is None:
         offsets = torch.zeros(env.num_envs, 3, device=env.device)

@@ -27,7 +27,7 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--task", default="VLA-YCBSugarBox-G1-GraspLift-RL-v1")
+parser.add_argument("--task", default="VLA-YCBGraspLift-SugarBox-G1-v0")
 parser.add_argument("--modes", nargs="+", default=("zero", "close", "close_lift"),
                     choices=("zero", "close", "close_lift"))
 parser.add_argument("--num-envs", type=int, default=64)
@@ -62,14 +62,11 @@ from vla_isaaclab.envs.common import (
     LEFT_END_EFFECTOR,
     LEFT_HAND_CLOSED_JOINT_POSITIONS,
     LEFT_HAND_JOINT_NAMES,
-    camera_cfg,
-    g1_left_wrist_camera_cfg,
 )
-from vla_isaaclab.envs.ycb_sugar_box.env_cfg import CAMERA_EYE, CAMERA_TARGET
-from vla_isaaclab.envs.ycb_sugar_box.mdp import grasp_rl
+from vla_isaaclab.envs.ycb_grasp.env_cfg import VIDEO_CAMERAS, add_video_cameras
+from vla_isaaclab.envs.ycb_grasp.mdp import grasp_rl
 
 
-VIDEO_CAMERAS = ("cam_side", "cam_left_wrist")
 
 
 class Videos:
@@ -167,7 +164,7 @@ def run(env, mode: str) -> dict:
         high_steps += int(high.sum())
         contact_high += int((high & grasp_rl.grasp_flag(env)).sum())
         held_high += int((high & grasp_rl.grasp_held(env)).sum())
-        rel_speeds.append(grasp_rl.box_palm_relative_speed(env)[high & grasp_rl.grasp_flag(env)])
+        rel_speeds.append(grasp_rl.object_palm_relative_speed(env)[high & grasp_rl.grasp_flag(env)])
         run = torch.where(high & grasp_rl.grasp_flag(env), run + 1, torch.zeros_like(run))
         longest = torch.maximum(longest, run)
         if hasattr(env, grasp_rl.GOAL_ATTR):
@@ -222,8 +219,7 @@ def main() -> int:
     if ARGS.robot_gravity != "cfg":
         cfg.scene.robot.spawn.rigid_props.disable_gravity = ARGS.robot_gravity == "off"
     if RECORD:
-        cfg.scene.cam_side = camera_cfg(CAMERA_EYE, CAMERA_TARGET)
-        cfg.scene.cam_left_wrist = g1_left_wrist_camera_cfg()
+        add_video_cameras(cfg)
     cfg.episode_length_s = max(cfg.episode_length_s, (ARGS.steps + 5) * cfg.decimation * cfg.sim.dt)
     env = gym.make(ARGS.task, cfg=cfg).unwrapped
     try:

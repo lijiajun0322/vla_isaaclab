@@ -14,6 +14,7 @@ from .g1 import (
     make_g1_cfg,
 )
 from .base import VLAEnvCfg
+from .objects import MUSTARD_BOTTLE, PROJECT_ROOT, SUGAR_BOX, GraspObjectSpec, object_rigid_cfg, object_up_axis
 from .managers import EventsCfg, JointLimitActionsCfg, PreviewObservationsCfg, PreviewRewardsCfg, PreviewTerminationsCfg
 from .scene import (
     SUPPORT_HEIGHT,
@@ -30,6 +31,7 @@ __all__ = [
     "ACTION_JOINT_NAMES",
     "CONTRACT_JOINT_NAMES",
     "EventsCfg",
+    "GraspObjectSpec",
     "JointLimitActionsCfg",
     "LEFT_ARM_JOINT_NAMES",
     "LEFT_END_EFFECTOR",
@@ -37,10 +39,13 @@ __all__ = [
     "LEFT_HAND_JOINT_NAMES",
     "LEFT_HAND_OPEN_JOINT_POSITIONS",
     "LOWER_BODY_JOINT_NAMES",
+    "MUSTARD_BOTTLE",
     "PreviewObservationsCfg",
     "PreviewRewardsCfg",
     "PreviewTerminationsCfg",
+    "PROJECT_ROOT",
     "RIGHT_END_EFFECTOR",
+    "SUGAR_BOX",
     "SUPPORT_HEIGHT",
     "WAIST_JOINT_NAMES",
     "VLAEnvCfg",
@@ -50,6 +55,8 @@ __all__ = [
     "ground_cfg",
     "light_cfgs",
     "make_g1_cfg",
+    "object_rigid_cfg",
+    "object_up_axis",
     "robot_rgb_camera_cfg",
     "table_cfgs",
 ]

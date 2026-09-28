@@ -1,4 +1,4 @@
-"""Sugar-box success and failure termination terms."""
+"""Sugar-box success termination terms."""
 
 import torch
 
@@ -39,17 +39,3 @@ def task_success(
         env.task_success_counter = counter
     counter[:] = torch.where(instantaneous, counter + 1, torch.zeros_like(counter))
     return counter >= hold_steps
-
-
-def object_fallen(env: ManagerBasedRLEnv, support_height: float) -> torch.Tensor:
-    sugar_box: RigidObject = env.scene["object"]
-    return sugar_box.data.root_pos_w[:, 2] < support_height - 0.05
-
-
-def invalid_state(env: ManagerBasedRLEnv) -> torch.Tensor:
-    robot: Articulation = env.scene["robot"]
-    sugar_box: RigidObject = env.scene["object"]
-    return ~(
-        torch.isfinite(robot.data.joint_pos).all(dim=-1)
-        & torch.isfinite(sugar_box.data.root_state_w).all(dim=-1)
-    )

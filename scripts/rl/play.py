@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a trained sugar-box grasp-and-lift policy, optionally with videos.
+"""Evaluate a trained YCB grasp-and-lift policy, optionally with videos.
 
 Every env runs exactly one episode from a random pregrasp-table state. With a
 "success" termination (v1 task) that is the success signal; otherwise success
@@ -25,7 +25,7 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--task", default="VLA-YCBSugarBox-G1-GraspLift-RL-v1")
+parser.add_argument("--task", default="VLA-YCBGraspLift-SugarBox-G1-v0")
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--num-envs", type=int, default=256)
 parser.add_argument("--seed", type=int, default=7)
@@ -39,6 +39,8 @@ parser.add_argument("--hold-hand", choices=("policy", "squeeze"), default="polic
                     help="During --hold-after-lift-s: hand from the policy, or a scripted full-rate squeeze.")
 parser.add_argument("--squeeze-fraction", type=float, default=1.0,
                     help="Scripted squeeze strength as a fraction of the hand action limit (1.0 = 0.05 rad/step).")
+parser.add_argument("--stochastic", action="store_true",
+                    help="Sample actions with the policy's exploration noise, as in training (default: mean action).")
 parser.add_argument("--video-dir", type=Path, default=None,
                     help="Record env 0 from the side and left-wrist cameras into this directory.")
 AppLauncher.add_app_launcher_args(parser)
@@ -66,14 +68,11 @@ from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg
 from vla_isaaclab.envs.common import (
     LEFT_HAND_CLOSED_JOINT_POSITIONS,
     LEFT_HAND_JOINT_NAMES,
-    camera_cfg,
-    g1_left_wrist_camera_cfg,
 )
-from vla_isaaclab.envs.ycb_sugar_box.env_cfg import CAMERA_EYE, CAMERA_TARGET
-from vla_isaaclab.envs.ycb_sugar_box.mdp import grasp_rl
+from vla_isaaclab.envs.ycb_grasp.env_cfg import VIDEO_CAMERAS, add_video_cameras
+from vla_isaaclab.envs.ycb_grasp.mdp import grasp_rl
 
 
-VIDEO_CAMERAS = ("cam_side", "cam_left_wrist")
 
 
 def open_videos():
@@ -148,12 +147,12 @@ def hold_after_lift(env, base, policy, videos) -> int:
                 write_frames(base, videos)
             done = dones.bool()
             live = alive & ~done
-            fired, error = grasp_rl._held_lift_event(base, 0.05)
+            fired, error = grasp_rl.held_lift_event(base, 0.05)
             new = live & (lift_step < 0) & fired
             lift_step[new] = step
             lift_error[new] = error[new]
             lift_height0[new] = grasp_rl.lift_height(base)[new]
-            box_in_palm0[new] = grasp_rl.box_pose_in_palm(base)[new, :3]
+            box_in_palm0[new] = grasp_rl.object_pose_in_palm(base)[new, :3]
             palm_z = grasp_rl.palm_pose_b(base)[:, 2]
             palm_z0[new] = palm_z[new]
             palm_hold[new] = grasp_rl.palm_pose_b(base)[new]
@@ -161,7 +160,7 @@ def hold_after_lift(env, base, policy, videos) -> int:
             held_count += (watching & grasp_rl.grasp_held(base)).float()
             min_height = torch.where(watching, torch.minimum(min_height, grasp_rl.lift_height(base)), min_height)
             max_error = torch.where(watching, torch.maximum(max_error, error), max_error)
-            slip = torch.linalg.vector_norm(grasp_rl.box_pose_in_palm(base)[:, :3] - box_in_palm0, dim=-1)
+            slip = torch.linalg.vector_norm(grasp_rl.object_pose_in_palm(base)[:, :3] - box_in_palm0, dim=-1)
             max_slip = torch.where(watching, torch.maximum(max_slip, slip), max_slip)
             max_palm_drop = torch.where(watching, torch.maximum(max_palm_drop, palm_z0 - palm_z), max_palm_drop)
             done_hold |= (lift_step >= 0) & (step - lift_step >= hold_steps)
@@ -200,7 +199,7 @@ def hold_after_lift(env, base, policy, videos) -> int:
         "videos": None if videos is None else [str(ARGS.video_dir / f"{c}.mp4") for c in VIDEO_CAMERAS],
     }
     print(json.dumps(report, indent=2), flush=True)
-    out = ARGS.checkpoint.with_name(f"{ARGS.checkpoint.stem}_hold_{ARGS.hold_hand}"
+    out = ARGS.checkpoint.with_name(f"{ARGS.checkpoint.stem}{'_stochastic' if ARGS.stochastic else ''}_hold_{ARGS.hold_hand}"
                                   + (f"{ARGS.squeeze_fraction:g}" if ARGS.hold_hand == "squeeze" else "") + "_eval.json")
     out.write_text(json.dumps(report, indent=2) + "\n")
     return 0
@@ -210,8 +209,7 @@ def main() -> int:
     env_cfg = parse_env_cfg(ARGS.task, device=ARGS.device, num_envs=ARGS.num_envs)
     env_cfg.seed = ARGS.seed
     if RECORD:
-        env_cfg.scene.cam_side = camera_cfg(CAMERA_EYE, CAMERA_TARGET)
-        env_cfg.scene.cam_left_wrist = g1_left_wrist_camera_cfg()
+        add_video_cameras(env_cfg)
     if ARGS.hold_after_lift_s is not None:
         env_cfg.terminations.success = None
         env_cfg.terminations.lifted_off_pose = None
@@ -224,6 +222,10 @@ def main() -> int:
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         runner.load(str(ARGS.checkpoint), load_optimizer=False)
         policy = runner.get_inference_policy(device=base.device)
+        if ARGS.stochastic:
+            normalizer = runner.obs_normalizer.to(base.device)
+            policy = lambda obs: runner.alg.actor_critic.act(normalizer(obs))  # noqa: E731
+
 
         n = base.num_envs
         alive = torch.ones(n, dtype=torch.bool, device=base.device)
@@ -257,7 +259,7 @@ def main() -> int:
                 # Terminal-step state is already reset; score only continuing steps.
                 live = alive & ~done
                 lift = grasp_rl.lift_height(base)
-                holding = grasp_rl.grasp_flag(base) & (lift > ARGS.success_height_m) & (grasp_rl.box_tilt(base) < max_tilt)
+                holding = grasp_rl.grasp_flag(base) & (lift > ARGS.success_height_m) & (grasp_rl.object_tilt(base) < max_tilt)
                 streak = torch.where(live & holding, streak + 1, torch.zeros_like(streak))
                 success |= live & (streak >= ARGS.success_hold_steps)
                 grasped |= live & grasp_rl.grasp_flag(base)
@@ -265,7 +267,7 @@ def main() -> int:
                 high_steps += int(high.sum())
                 contact_high += int((high & grasp_rl.grasp_flag(base)).sum())
                 held_high += int((high & grasp_rl.grasp_held(base)).sum())
-                rel_speeds.append(grasp_rl.box_palm_relative_speed(base)[high & grasp_rl.grasp_flag(base)])
+                rel_speeds.append(grasp_rl.object_palm_relative_speed(base)[high & grasp_rl.grasp_flag(base)])
                 run = torch.where(high & grasp_rl.grasp_flag(base), run + 1, torch.zeros_like(run))
                 longest = torch.maximum(longest, run)
                 peak_lift = torch.where(live, torch.maximum(peak_lift, lift), peak_lift)
@@ -307,7 +309,7 @@ def main() -> int:
             "videos": None if videos is None else [str(ARGS.video_dir / f"{c}.mp4") for c in VIDEO_CAMERAS],
         }
         print(json.dumps(report, indent=2), flush=True)
-        out = ARGS.checkpoint.with_name(ARGS.checkpoint.stem + "_eval.json")
+        out = ARGS.checkpoint.with_name(ARGS.checkpoint.stem + ("_stochastic" if ARGS.stochastic else "") + "_eval.json")
         out.write_text(json.dumps(report, indent=2) + "\n")
         return 0
     finally:

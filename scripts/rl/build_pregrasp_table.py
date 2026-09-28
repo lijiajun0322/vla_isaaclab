@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Build a table of collision-free sugar-box pregrasp states for RL resets.
+"""Build a table of collision-free pregrasp states of one YCB object for RL resets.
 
-For each sampled box pose the scripted pregrasp palm pose is computed in closed
+The object and its calibrated approach come from the grasp-lift task's
+object_spec. For each sampled object pose the scripted pregrasp palm pose is computed in closed
 form, the arm is solved kinematically onto it (turn point -> orient -> pregrasp,
 like the scripted approach), and a short static hold with the box in place
 checks for contact, box motion and table contact. A failing pose is retried
@@ -28,13 +29,16 @@ from isaaclab.app import AppLauncher
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task", default="VLA-YCBGraspLift-SugarBox-G1-v0",
+                        help="Grasp-lift Gym ID whose object_spec to use.")
     parser.add_argument("--num-envs", type=int, default=1024, help="Candidates evaluated in parallel per batch.")
     parser.add_argument("--target-valid", type=int, default=10000, help="Stop once this many states pass.")
     parser.add_argument("--max-batches", type=int, default=40)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--x-range-m", type=float, nargs=2, default=(-0.02, 0.02))
-    parser.add_argument("--y-range-m", type=float, nargs=2, default=(-0.02, 0.02))
-    parser.add_argument("--yaw-range-deg", type=float, nargs=2, default=(-15.0, 15.0))
+    # Pose ranges default to the object_spec's reset randomization.
+    parser.add_argument("--x-range-m", type=float, nargs=2, default=None)
+    parser.add_argument("--y-range-m", type=float, nargs=2, default=None)
+    parser.add_argument("--yaw-range-deg", type=float, nargs=2, default=None)
     parser.add_argument("--backoffs-m", type=float, nargs="+", default=(0.0, 0.005, 0.01, 0.015),
                         help="Palm pull-back distances tried in order until a state passes.")
     parser.add_argument("--palm-noise-m", type=float, default=0.0, help="Uniform per-axis palm target noise.")
@@ -57,9 +61,10 @@ def parse_args():
     parser.add_argument("--max-settled-palm-m", type=float, default=0.01)
     parser.add_argument("--hand-preshape", type=float, nargs=4, default=None,
                         metavar=("THUMB_ROTATE", "THUMB", "INDEX", "MIDDLE"),
-                        help="Finger preshape curl (rad magnitudes); default is DEFAULT_HAND_PRESHAPE.")
-    parser.add_argument("--open-hand", action="store_true", help="Keep the hand fully open (the original table).")
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs/rl/pregrasp_table_preshape.pt")
+                        help="Finger preshape curl (rad magnitudes); default is the object_spec's hand_preshape.")
+    parser.add_argument("--open-hand", action="store_true", help="Keep the hand fully open.")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Default: outputs/rl/<object>/pregrasp_table_{preshape,open}.pt")
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     args.enable_cameras = False
@@ -77,26 +82,37 @@ import vla_isaaclab  # noqa: F401  Register environments.
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.utils.math import quat_from_angle_axis, quat_mul, sample_uniform
 
-from vla_isaaclab.envs.ycb_sugar_box.env_cfg import YCBSugarBoxStateEnvCfg
+from isaaclab_tasks.utils import parse_env_cfg
+
+from vla_isaaclab.envs.ycb_grasp.env_cfg import YCBGraspStateEnvCfg
 from vla_isaaclab.rl.pregrasp_table import (
     ARM_JOINT_NAMES,
-    DEFAULT_HAND_PRESHAPE,
     FINGERTIP_BODY_NAMES,
     TABLE_FORMAT_VERSION,
     ArmKinematics,
     hand_preshape_joint_pos,
     load_pregrasp_table,
     pregrasp_palm_target,
+    pregrasp_table_path,
     reset_from_pregrasp_table,
     settle_check,
     turn_point,
 )
 
+SPEC = parse_env_cfg(ARGS.task, device=ARGS.device, num_envs=1).object_spec
+if ARGS.x_range_m is None:
+    ARGS.x_range_m = SPEC.dr_x_range_m
+if ARGS.y_range_m is None:
+    ARGS.y_range_m = SPEC.dr_y_range_m
+YAW_RANGE_RAD = SPEC.dr_yaw_range_rad if ARGS.yaw_range_deg is None else [math.radians(v) for v in ARGS.yaw_range_deg]
+if ARGS.output is None:
+    ARGS.output = pregrasp_table_path(SPEC, open_hand=ARGS.open_hand)
+
 
 def sample_box_poses(env, generator_seed: int):
     box = env.scene["object"]
     ranges = torch.tensor(
-        (ARGS.x_range_m, ARGS.y_range_m, [math.radians(v) for v in ARGS.yaw_range_deg]),
+        (ARGS.x_range_m, ARGS.y_range_m, YAW_RANGE_RAD),
         dtype=torch.float32, device=env.device,
     )
     torch.manual_seed(generator_seed)
@@ -188,24 +204,24 @@ def save_plot(offsets, valid, backoff, path: Path):
 
 def check_against_strategy(env, nominal_pos, nominal_quat) -> dict:
     """The closed-form targets must equal the scripted strategy's on the same box poses."""
-    from vla_isaaclab.policies.ycb_sugar_box import _G1Semantics, _SugarBoxSemantics
+    from vla_isaaclab.policies.ycb_sugar_box import _G1Semantics
     from vla_isaaclab.policies.ycb_sugar_box_strategy import SugarBoxPhaseStrategy
 
     box = env.scene["object"]
     _, box_pose = sample_box_poses(env, 12345)
     box.write_root_pose_to_sim(box_pose)
-    strategy = SugarBoxPhaseStrategy(env, _G1Semantics, _SugarBoxSemantics)
+    strategy = SugarBoxPhaseStrategy(env, _G1Semantics, SPEC)
     strategy._compute_grasp()
     zero = torch.zeros(env.num_envs, device=env.device)
     pos, quat, _ = pregrasp_palm_target(
-        box_pose[:, :3], box_pose[:, 3:7], nominal_quat, env.scene["robot"].data.root_pos_w, zero
+        SPEC, box_pose[:, :3], box_pose[:, 3:7], nominal_quat, env.scene["robot"].data.root_pos_w, zero
     )
-    turn = turn_point(box_pose[:, :3], box_pose[:, 3:7], nominal_pos, nominal_quat, env.scene.env_origins)
+    turn = turn_point(SPEC, box_pose[:, :3], box_pose[:, 3:7], nominal_pos, nominal_quat, env.scene.env_origins)
     return {
         "pregrasp_position_max_diff_m": torch.linalg.vector_norm(pos - strategy.grasp_pos, dim=-1).max().item(),
         "pregrasp_quat_max_diff": (quat - strategy.grasp_quat).abs().max().item(),
         "turn_point_max_diff_m": torch.linalg.vector_norm(
-            turn - strategy._box_frame_point(strategy.TURN_POINT_WORLD), dim=-1
+            turn - strategy._box_frame_point(SPEC.turn_point_world), dim=-1
         ).max().item(),
     }
 
@@ -239,7 +255,7 @@ def verify_table(env, kinematics, path: Path) -> dict:
 
 
 def main() -> int:
-    cfg = YCBSugarBoxStateEnvCfg()
+    cfg = YCBGraspStateEnvCfg(object_spec=SPEC)
     cfg.scene.num_envs = ARGS.num_envs
     cfg.sim.device = ARGS.device
     cfg.seed = ARGS.seed
@@ -252,7 +268,7 @@ def main() -> int:
         if ARGS.open_hand:
             hand_preshape = {}
         else:
-            curls = dict(zip(DEFAULT_HAND_PRESHAPE, ARGS.hand_preshape)) if ARGS.hand_preshape else DEFAULT_HAND_PRESHAPE
+            curls = dict(zip(SPEC.hand_preshape, ARGS.hand_preshape)) if ARGS.hand_preshape else SPEC.hand_preshape
             hand_preshape = hand_preshape_joint_pos(**curls)
             kinematics.set_hand(hand_preshape)
         kinematics.hand_joint_ids = robot.find_joints([n for n in robot.joint_names if n.startswith("left_hand_")])[0]
@@ -297,9 +313,9 @@ def main() -> int:
             box_pos, box_quat = box_pose[:, :3], box_pose[:, 3:7]
             # Scripted order: go to the turn point keeping the home orientation,
             # rotate there, then move to the pregrasp.
-            turn = turn_point(box_pos, box_quat, nominal_pos, nominal_quat, env.scene.env_origins)
+            turn = turn_point(SPEC, box_pos, box_quat, nominal_pos, nominal_quat, env.scene.env_origins)
             zero = torch.zeros(env.num_envs, device=env.device)
-            _, grasp_quat, _ = pregrasp_palm_target(box_pos, box_quat, nominal_quat, robot.data.root_pos_w, zero)
+            _, grasp_quat, _ = pregrasp_palm_target(SPEC, box_pos, box_quat, nominal_quat, robot.data.root_pos_w, zero)
             arm_q, _ = kinematics.solve(home_arm, turn, home_quat, iterations=40)
             arm_q, _ = kinematics.solve(arm_q, turn, grasp_quat, iterations=40)
 
@@ -307,7 +323,7 @@ def main() -> int:
             record = None
             for attempt, backoff in enumerate(backoffs):
                 target_pos, target_quat, _ = pregrasp_palm_target(
-                    box_pos, box_quat, nominal_quat, robot.data.root_pos_w, torch.full_like(zero, backoff)
+                    SPEC, box_pos, box_quat, nominal_quat, robot.data.root_pos_w, torch.full_like(zero, backoff)
                 )
                 target_pos, target_quat = noisy_target(target_pos, target_quat)
                 arm_q, ik = kinematics.solve(arm_q, target_pos, target_quat, iterations=80 if attempt == 0 else 40)
@@ -375,6 +391,7 @@ def main() -> int:
 
         tips = metrics["fingertips_in_box_m"][valid].reshape(-1, len(FINGERTIP_BODY_NAMES), 3)
         summary = {
+            "object": SPEC.name,
             "output": str(ARGS.output),
             "git_commit": git_commit(),
             "candidates": len(valid),
@@ -411,7 +428,7 @@ def main() -> int:
                 "arm_contact_force_n": stats("arm_contact_force_n"),
                 "settled_palm_position_error_mm": stats("settled_palm_position_error_m", 1e3),
             },
-            # Box frame: x width (92 mm), y height, z thickness (45 mm).
+            # Object root frame, see GraspObjectSpec.half_extents_m.
             "accepted_fingertips_in_box_mm_median": {
                 name: (tips[:, i].median(dim=0).values * 1e3).tolist() for i, name in enumerate(FINGERTIP_BODY_NAMES)
             } if tips.numel() else None,
@@ -422,6 +439,7 @@ def main() -> int:
         torch.save(
             {
                 "format_version": TABLE_FORMAT_VERSION,
+                "object_name": SPEC.name,
                 "joint_names": list(robot.joint_names),
                 "arm_joint_names": list(ARM_JOINT_NAMES),
                 "metric_names": list(metrics),

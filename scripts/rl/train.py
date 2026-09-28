@@ -17,13 +17,15 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--task", default="VLA-YCBSugarBox-G1-GraspLift-RL-v0")
+parser.add_argument("--task", default="VLA-YCBGraspLift-SugarBox-G1-v0")
 parser.add_argument("--num-envs", type=int, default=2048)
 parser.add_argument("--max-iterations", type=int, default=None)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--run-name", default="")
 parser.add_argument("--resume", type=Path, default=None, help="Checkpoint (.pt) to continue from.")
 parser.add_argument("--log-root", type=Path, default=PROJECT_ROOT / "outputs/rl/runs")
+parser.add_argument("--verbose-log", action="store_true",
+                    help="Also print RSL-RL's full per-iteration block (default: a short summary).")
 AppLauncher.add_app_launcher_args(parser)
 ARGS = parser.parse_args()
 ARGS.enable_cameras = False
@@ -33,11 +35,11 @@ APP = AppLauncher(ARGS).app
 
 import gymnasium as gym
 import torch
-from rsl_rl.runners import OnPolicyRunner
 
 import vla_isaaclab  # noqa: F401  Register environments.
 import vla_isaaclab.rl.isaaclab_rl_compat  # noqa: F401  Before any isaaclab_rl import.
 from vla_isaaclab.rl.action_clip import ClippedRslRlVecEnvWrapper
+from vla_isaaclab.rl.readable_log import ReadableOnPolicyRunner
 from isaaclab.utils.io import dump_pickle, dump_yaml
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg
 
@@ -60,7 +62,8 @@ def main() -> int:
 
     env = ClippedRslRlVecEnvWrapper(gym.make(ARGS.task, cfg=env_cfg))
     try:
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=str(log_dir), device=agent_cfg.device)
+        runner = ReadableOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=str(log_dir), device=agent_cfg.device,
+                                        verbose=ARGS.verbose_log)
         runner.add_git_repo_to_log(__file__)
         if ARGS.resume is not None:
             print(f"[train] resuming from {ARGS.resume}", flush=True)

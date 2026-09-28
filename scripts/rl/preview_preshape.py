@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Preview the planned finger preshape from pregrasp-table states, with videos.
+"""Preview a finger preshape from open-hand pregrasp-table states, with videos.
 
-The arm holds its pregrasp pose. The thumb rotates to face the fingers, then
+Runs the grasp-lift task with two changes: resets from the object's open-hand
+table (``build_pregrasp_table.sh --open-hand``) and absolute hand targets
+(action 0 = open hand). The arm holds its pregrasp pose. The thumb rotates to face the fingers, then
 the thumb, index and middle each close slowly until they touch the box and
 back off a little. Env 0 is recorded from the side and left-wrist cameras;
 the printed summary covers all envs.
@@ -23,7 +25,7 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--task", default="VLA-YCBSugarBox-G1-GraspLift-RL-v0")
+parser.add_argument("--task", default="VLA-YCBGraspLift-SugarBox-G1-v0")
 parser.add_argument("--num-envs", type=int, default=16)
 parser.add_argument("--seed", type=int, default=7)
 parser.add_argument("--close-rate", type=float, default=0.02, help="Finger closing speed, rad per step.")
@@ -48,25 +50,24 @@ import numpy as np
 import torch
 
 import vla_isaaclab  # noqa: F401
+from isaaclab.envs.mdp.actions import JointPositionActionCfg
 from isaaclab_tasks.utils import parse_env_cfg
 
 from vla_isaaclab.envs.common import (
     LEFT_HAND_CLOSED_JOINT_POSITIONS,
     LEFT_HAND_JOINT_NAMES,
-    camera_cfg,
-    g1_left_wrist_camera_cfg,
 )
-from vla_isaaclab.envs.ycb_sugar_box.env_cfg import CAMERA_EYE, CAMERA_TARGET
-from vla_isaaclab.envs.ycb_sugar_box.mdp import grasp_rl
+from vla_isaaclab.envs.ycb_grasp.env_cfg import VIDEO_CAMERAS, add_video_cameras
+from vla_isaaclab.envs.ycb_grasp.mdp import grasp_rl
+from vla_isaaclab.rl.pregrasp_table import pregrasp_table_path
 
 
-VIDEO_CAMERAS = ("cam_side", "cam_left_wrist")
 CLOSED = dict(zip(LEFT_HAND_JOINT_NAMES, LEFT_HAND_CLOSED_JOINT_POSITIONS))
 # Each finger closes as one unit and stops when any of its links touches the box.
 FINGERS = {
-    "thumb": (("left_hand_thumb_1_joint", "left_hand_thumb_2_joint"), ("box_contact_thumb_1", "box_contact_thumb_2")),
-    "index": (("left_hand_index_0_joint", "left_hand_index_1_joint"), ("box_contact_index_0", "box_contact_index_1")),
-    "middle": (("left_hand_middle_0_joint", "left_hand_middle_1_joint"), ("box_contact_middle_0", "box_contact_middle_1")),
+    "thumb": (("left_hand_thumb_1_joint", "left_hand_thumb_2_joint"), ("object_contact_thumb_1", "object_contact_thumb_2")),
+    "index": (("left_hand_index_0_joint", "left_hand_index_1_joint"), ("object_contact_index_0", "object_contact_index_1")),
+    "middle": (("left_hand_middle_0_joint", "left_hand_middle_1_joint"), ("object_contact_middle_0", "object_contact_middle_1")),
 }
 HOLD_STEPS, ROTATE_STEPS, CLOSE_STEPS, SETTLE_STEPS = 20, 20, 130, 40
 
@@ -101,18 +102,19 @@ def close_videos(videos):
 
 
 def tip_gaps_mm(env) -> torch.Tensor:
-    """Fingertip-link origin distance to the box surface, (num_envs, 3) in mm."""
-    tips = grasp_rl.fingertips_in_box(env)
-    outside = (tips.abs() - tips.new_tensor(grasp_rl.BOX_HALF_EXTENTS_M)).clamp(min=0.0)
-    return torch.linalg.vector_norm(outside, dim=-1) * 1e3
+    """Fingertip-link origin distance to the object's collider box, (num_envs, 3) in mm."""
+    return grasp_rl.fingertip_surface_gaps(env) * 1e3
 
 
 def main() -> int:
     cfg = parse_env_cfg(ARGS.task, device=ARGS.device, num_envs=ARGS.num_envs)
     cfg.seed = ARGS.seed
+    cfg.events.reset_to_pregrasp.params["table_path"] = str(pregrasp_table_path(cfg.object_spec, open_hand=True))
+    cfg.actions.hand = JointPositionActionCfg(
+        asset_name="robot", joint_names=list(LEFT_HAND_JOINT_NAMES), scale=1.0, use_default_offset=True
+    )
     if not ARGS.no_video:
-        cfg.scene.cam_side = camera_cfg(CAMERA_EYE, CAMERA_TARGET)
-        cfg.scene.cam_left_wrist = g1_left_wrist_camera_cfg()
+        add_video_cameras(cfg)
     total = HOLD_STEPS + ROTATE_STEPS + CLOSE_STEPS + SETTLE_STEPS
     cfg.episode_length_s = max(cfg.episode_length_s, (total + 5) * cfg.decimation * cfg.sim.dt)
     env = gym.make(ARGS.task, cfg=cfg).unwrapped
@@ -134,7 +136,7 @@ def main() -> int:
             start_gap = tip_gaps_mm(env)
             box = env.scene["object"]
             box_start = box.data.root_pos_w.clone()
-            tilt_start = grasp_rl.box_tilt(env).clone()
+            tilt_start = grasp_rl.object_tilt(env).clone()
             # Probe: curl (rad magnitude) at first touch; NaN if the finger reached its limit untouched.
             hit_curl = {f: torch.full((n,), float("nan"), device=device) for f in FINGERS}
             ever_contact = {f: torch.zeros(n, dtype=torch.bool, device=device) for f in FINGERS}
@@ -190,12 +192,12 @@ def main() -> int:
                 "box_move_mm": {"median": box_move_max.median().item() * 1e3,
                                 "p95": box_move_max.quantile(0.95).item() * 1e3,
                                 "max": box_move_max.max().item() * 1e3},
-                "box_tilt_change_deg_max": torch.rad2deg((grasp_rl.box_tilt(env) - tilt_start).abs()).max().item(),
+                "box_tilt_change_deg_max": torch.rad2deg((grasp_rl.object_tilt(env) - tilt_start).abs()).max().item(),
                 "still_running": int(alive.sum().item()),
                 "finger_touched_then_backed_off": {f: t.float().mean().item() for f, t in touched.items()},
                 "tip_gap_mm_before": dict(zip(("thumb", "index", "middle"), start_gap.median(0).values.tolist())),
                 "tip_gap_mm_after": dict(zip(("thumb", "index", "middle"), gap.median(0).values.tolist())),
-                "box_contact_after_n": dict(zip(grasp_rl.HAND_CONTACT_SENSORS,
+                "object_contact_after_n": dict(zip(grasp_rl.HAND_CONTACT_SENSORS,
                                                 grasp_rl.contact_forces(env)[0].tolist())),
                 "env0_hand_joints_rad": dict(zip(names, env.scene["robot"].data.joint_pos[0, joint_ids].tolist())),
                 "videos": None if videos is None else [str(ARGS.video_dir / f"{c}.mp4") for c in VIDEO_CAMERAS],

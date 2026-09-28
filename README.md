@@ -113,10 +113,18 @@ vla_isaaclab/
 │   │   │   ├── base.py             common simulation timing/material settings
 │   │   │   ├── g1.py               reusable G1 config and joint semantics
 │   │   │   ├── managers.py         built-in action, observations, reset events
+│   │   │   ├── mdp.py              object-agnostic reset/termination terms
+│   │   │   ├── objects.py          GraspObjectSpec per graspable object
 │   │   │   └── scene.py            shared table/light/camera helpers
 │   │   ├── scene_preview/
 │   │   │   ├── __init__.py         three Gym registrations
 │   │   │   └── env_cfg.py          YCB, dinnerware, microwave complete scenes
+│   │   ├── ycb_grasp/
+│   │   │   ├── __init__.py         one grasp-lift RL Gym ID per object
+│   │   │   ├── env_cfg.py          camera-free G1 + one object scene
+│   │   │   ├── rl_env_cfg.py       grasp-lift actions/observations/rewards
+│   │   │   ├── agents/             RSL-RL PPO configs
+│   │   │   └── mdp/grasp_rl.py     grasp-lift observation/reward/termination terms
 │   │   └── ycb_sugar_box/
 │   │       ├── __init__.py         sugar-box Gym registration
 │   │       ├── env_cfg.py          G1 + one sugar box + all manager configs
@@ -126,6 +134,7 @@ vla_isaaclab/
 │   │   ├── ycb_sugar_box*.py       scripted phases and action generation
 │   │   ├── bounded_ik.py           bounded DLS IK helper
 │   │   └── joint_limits.py         inverse of the built-in action mapping
+│   ├── rl/                          pregrasp state table, RSL-RL helpers
 │   └── recording/                   HDF5 staging and LeRobot v3/v2.1 pipeline
 ├── tests/                           simulator-free unit tests
 └── outputs/                         local caches/videos/datasets; ignored by Git
@@ -161,6 +170,39 @@ Importing `vla_isaaclab` registers these IDs with Gymnasium:
 - `VLA-ScenePreview-Dinnerware-G1-v0`
 - `VLA-ScenePreview-Microwave-G1-v0`
 - `VLA-YCBSugarBox-G1-JointPos-v0`
+- `VLA-YCBSugarBox-G1-JointPos-DR-v0` (randomized box pose)
+- `VLA-YCBGraspLift-<Object>-G1-v0` for `SugarBox` and `MustardBottle` (RL
+  grasp-and-lift; smaller action space)
+- `VLA-YCBGraspLift-<Object>-G1-Fast-v0`: the same task at 5x the palm and
+  finger speed limits with 5 s episodes, for training from scratch
+
+To add an object to the grasp-lift RL task: add a `GraspObjectSpec` in
+`envs/common/objects.py`, env config classes (normal and `fast_actions`) and a
+PPO runner config class at the end of `envs/ycb_grasp/rl_env_cfg.py` and
+`agents/rsl_rl_ppo_cfg.py`, and an entry in `OBJECTS` in
+`envs/ycb_grasp/__init__.py`; then build its pregrasp table with
+`./scripts/rl/build_pregrasp_table.sh --headless --task <ID>`. An object whose
+grasp height is out of the arm's reach can get a higher table
+(`support_height_m`).
+
+Grasp-lift training and evaluation:
+
+```bash
+# From scratch: fast limits first, then fine-tune at the normal (slow) limits.
+./scripts/rl/train.sh --headless --task VLA-YCBGraspLift-<Object>-G1-Fast-v0 \
+  --num-envs 1024 --max-iterations 200 --run-name fast200
+./scripts/rl/train.sh --headless --task VLA-YCBGraspLift-<Object>-G1-v0 \
+  --num-envs 1024 --max-iterations 200 --resume <fast run>/model_199.pt
+# One episode per env, mean actions; --stochastic samples with the exploration noise.
+./scripts/rl/play.sh --headless --task VLA-YCBGraspLift-<Object>-G1-v0 \
+  --checkpoint <run>/model_<N>.pt --num-envs 256
+```
+
+`train.sh` prints a short summary per iteration: how episodes end (success,
+lifted but off pose, object fell, timed out; weighted by episode duration) and
+the time left. `--verbose-log` also prints RSL-RL's full block. Runs go to
+`outputs/rl/runs/grasp_lift_<object>/`, and `play.sh` writes
+`<checkpoint>_eval.json` next to the checkpoint.
 
 To add a task, create a complete EnvCfg under `src/vla_isaaclab/envs/`, keep its
 MDP terms beside it, and register the EnvCfg in that environment package's
