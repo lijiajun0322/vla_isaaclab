@@ -124,7 +124,7 @@ class YCBSugarBoxGraspRLEnvCfg(YCBSugarBoxStateEnvCfg):
     events: GraspEventsCfg = GraspEventsCfg()
     rewards: GraspRewardsCfg = GraspRewardsCfg()
     terminations: GraspTerminationsCfg = GraspTerminationsCfg()
-    episode_length_s: float = 5.0
+    episode_length_s: float = 8.0
     task_instruction: str = "Grasp the YCB 004 sugar box and lift it off the table."
 
     def __post_init__(self):
@@ -144,21 +144,22 @@ class YCBSugarBoxGraspRLEnvCfg(YCBSugarBoxStateEnvCfg):
 
 @configclass
 class GraspV2ActionsCfg:
-    # Slow enough that the box cannot be flicked 5 cm up (that needs ~1 m/s):
-    # palm <= 15 cm/s and ~0.45 rad/s at 30 Hz with actions clipped to [-1, 1].
+    # One speed limit shared with the scripted place (scripts/rl/play_handoff.py):
+    # palm <= 3 cm/s and 0.15 rad/s, fingers <= 0.3 rad/s at 30 Hz with actions
+    # clipped to [-1, 1]. Far too slow to flick the box 5 cm up (~1 m/s needed).
     arm = DifferentialInverseKinematicsActionCfg(
         asset_name="robot",
         joint_names=list(LEFT_ARM_JOINT_NAMES),
         body_name=LEFT_END_EFFECTOR,
         controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=True, ik_method="dls"),
-        scale=(0.005, 0.005, 0.005, 0.015, 0.015, 0.015),
+        scale=(0.001, 0.001, 0.001, 0.005, 0.005, 0.005),
     )
-    # Target = current joint position + delta; at most 0.05 rad per step (1.5 rad/s).
+    # Target = current joint position + delta; at most 0.01 rad per step (0.3 rad/s).
     hand = RelativeJointPositionActionCfg(
         asset_name="robot",
         joint_names=list(LEFT_HAND_JOINT_NAMES),
-        scale=0.05,
-        clip={".*": (-0.05, 0.05)},
+        scale=0.01,
+        clip={".*": (-0.01, 0.01)},
     )
 
 
@@ -250,6 +251,6 @@ class YCBSugarBoxGraspRLV2EnvCfg(YCBSugarBoxGraspRLEnvCfg):
     events: GraspV2EventsCfg = GraspV2EventsCfg()
     rewards: GraspV2RewardsCfg = GraspV2RewardsCfg()
     terminations: GraspV2TerminationsCfg = GraspV2TerminationsCfg()
-    episode_length_s: float = 5.0
+    episode_length_s: float = 8.0
     # Policy actions are clamped to [-1, 1] by ClippedRslRlVecEnvWrapper.
     action_clip: float = 1.0

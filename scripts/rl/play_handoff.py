@@ -14,7 +14,7 @@ Both parts share one speed limit (--palm-speed, --palm-rot-speed,
 --finger-speed): the policy's actions are clipped to it, without retraining.
 The palm is driven through the same relative DiffIK action as the policy, as a
 pose tracker toward a moving palm target; the fingers keep a light fixed grip
-(--squeeze-fraction of the hand action limit) until release. Placement is
+(--grip-rad closing delta per step) until release. Placement is
 judged with the original sugar-box task_success thresholds, computed here: this
 RL task has no placement success termination, so the report does not claim one.
 """
@@ -40,8 +40,8 @@ parser.add_argument("--task", default="VLA-YCBSugarBox-G1-GraspLift-RL-v1")
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--num-envs", type=int, default=256)
 parser.add_argument("--seed", type=int, default=7)
-parser.add_argument("--squeeze-fraction", type=float, default=0.1,
-                    help="Grip during transport, as a fraction of the trained hand action limit (0.05 rad/step).")
+parser.add_argument("--grip-rad", type=float, default=0.005,
+                    help="Grip during transport: closing delta per step (rad); force ~ hand stiffness x delta.")
 # One speed limit for both the RL and the scripted part; RL actions are clipped to it.
 parser.add_argument("--palm-speed", type=float, default=0.03, help="m/s")
 parser.add_argument("--palm-rot-speed", type=float, default=0.15, help="rad/s")
@@ -171,7 +171,7 @@ def main() -> int:
         opened = torch.tensor([dict(zip(LEFT_HAND_JOINT_NAMES, LEFT_HAND_OPEN_JOINT_POSITIONS))[j] for j in hand_names],
                               device=device)
         squeeze = torch.tensor([0.0 if j == "left_hand_thumb_0_joint" else math.copysign(1.0, closed[j])
-                                for j in hand_names], device=device) * ARGS.squeeze_fraction
+                                for j in hand_names], device=device) * ARGS.grip_rad / hand_scale
         steps = {p: round(s / dt) for p, s in DURATION_S.items()}
         # Per-dimension action limit for the shared speeds (1.0 = the trained limit).
         limit = torch.cat((
@@ -190,6 +190,7 @@ def main() -> int:
         lift_step = torch.full((n,), -1, dtype=torch.long, device=device)
         placed = torch.zeros_like(lifted)
         streak = torch.zeros(n, dtype=torch.long, device=device)
+        best_streak = torch.zeros_like(streak)
         fell = torch.zeros_like(lifted)
         final = {}
         delta = torch.tensor(SugarBoxPhaseStrategy.TARGET_WORLD_DELTA, device=device)
@@ -256,6 +257,7 @@ def main() -> int:
                 streak = torch.where(checking & placement_ok(base, target_w, palm_body), streak + 1,
                                      torch.zeros_like(streak))
                 placed |= streak >= 15
+                best_streak = torch.maximum(best_streak, streak)
                 if bool(((phase == CHECK) & (phase_step >= steps[CHECK]) | fell).all()):
                     break
 
@@ -282,10 +284,17 @@ def main() -> int:
                 "final_xy_error_m": q(xy_error),
                 "final_height_error_m": q(height_error),
                 "final_tilt_deg": q(tilt),
+                "env0_final_checks": {
+                    "box_speed_mps": torch.linalg.vector_norm(box.data.root_lin_vel_w[0]).item(),
+                    "box_angular_speed_radps": torch.linalg.vector_norm(box.data.root_ang_vel_w[0]).item(),
+                    "hand_distance_m": torch.linalg.vector_norm(
+                        robot.data.body_pos_w[0, palm_body] - box.data.root_pos_w[0]).item(),
+                    "longest_ok_streak_steps": int(best_streak[0]),
+                },
                 "env0": {"phase": PHASE_NAMES[int(phase[0])], "placed": bool(placed[0]),
                          "xy_error_mm": xy_error[0].item() * 1e3, "height_error_mm": height_error[0].item() * 1e3,
                          "tilt_deg": tilt[0].item()},
-                "squeeze_fraction": ARGS.squeeze_fraction,
+                "grip_rad_per_step": ARGS.grip_rad,
                 "speed_limits": {"palm_mps": ARGS.palm_speed, "palm_radps": ARGS.palm_rot_speed,
                                  "finger_radps": ARGS.finger_speed},
                 "rl_lift_step_median": None if not bool(lifted.any()) else lift_step[lifted].float().median().item(),
