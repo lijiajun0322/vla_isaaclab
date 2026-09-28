@@ -217,30 +217,27 @@ class GraspV2EventsCfg:
     reset_progress = EventTerm(func=grasp_rl.reset_grasp_progress, mode="reset")
     # After reset_to_pregrasp, which sets the box start position.
     sample_goal = EventTerm(
-        func=grasp_rl.sample_lift_goal, mode="reset", params={"xy_range_m": 0.0, "z_range_m": (0.07, 0.07)}
+        func=grasp_rl.sample_lift_goal, mode="reset", params={"xy_range_m": 0.0, "z_range_m": (0.05, 0.05)}
     )
 
 
 @configclass
 class GraspV2RewardsCfg:
-    # DextrAH-G's six terms and weights (arXiv 2407.02274). The goal is the box's
-    # start pose raised 7 cm; distance to it is the largest box-corner gap.
+    # The episode ends the moment the held box passes 5 cm; that step is scored
+    # 100 * exp(-e / 3 cm), e = largest box-corner distance to the goal pose (the
+    # start pose raised 5 cm). Before that, DextrAH-G's progress terms.
     to_object = RewTerm(func=grasp_rl.dextrah_to_object, weight=5.0)
-    # Lift, goal and success terms only count while the box is held (grasp_held),
-    # so flicking the box into the air earns nothing.
     lift = RewTerm(func=grasp_rl.held_lift, weight=50.0, params={"z_lifted_m": 0.05})
-    lifted = RewTerm(func=grasp_rl.held_lifted, weight=50.0, params={"z_lifted_m": 0.05})
-    to_goal = RewTerm(func=grasp_rl.held_pose_to_goal, weight=1000.0, params={"z_lifted_m": 0.05})
-    reached = RewTerm(func=grasp_rl.held_pose_reached, weight=40.0)
-    success = RewTerm(func=grasp_rl.dextrah_success_bonus, weight=100.0)
+    lift_pose = RewTerm(func=grasp_rl.lift_pose_score, weight=100.0)
 
 
 @configclass
 class GraspV2TerminationsCfg:
-    # DextrAH-G: object below the table, success, or timeout.
     time_out = DoneTerm(func=base_mdp.time_out, time_out=True)
-    # Held, all box corners within 2 cm of the goal pose, box under 5 cm/s, for 1 s.
-    success = DoneTerm(func=grasp_rl.held_pose_success)
+    # Held box passed 5 cm: "success" if every corner is within 2 cm of the goal
+    # pose (about 10 degrees of tilt), otherwise "lifted_off_pose". Both end the episode.
+    success = DoneTerm(func=grasp_rl.lift_success)
+    lifted_off_pose = DoneTerm(func=grasp_rl.lift_off_pose)
     fell = DoneTerm(func=object_fallen, params={"support_height": SUPPORT_HEIGHT})
     # Simulator guard only (NaN state), not part of the task design.
     invalid_state = DoneTerm(func=invalid_state)
@@ -253,6 +250,6 @@ class YCBSugarBoxGraspRLV2EnvCfg(YCBSugarBoxGraspRLEnvCfg):
     events: GraspV2EventsCfg = GraspV2EventsCfg()
     rewards: GraspV2RewardsCfg = GraspV2RewardsCfg()
     terminations: GraspV2TerminationsCfg = GraspV2TerminationsCfg()
-    episode_length_s: float = 10.0  # DextrAH-G T_max
+    episode_length_s: float = 5.0
     # Policy actions are clamped to [-1, 1] by ClippedRslRlVecEnvWrapper.
     action_clip: float = 1.0

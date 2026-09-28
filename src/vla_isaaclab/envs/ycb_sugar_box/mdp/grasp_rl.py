@@ -351,7 +351,7 @@ def _goal(env) -> torch.Tensor:
     goal = getattr(env, GOAL_ATTR, None)
     if goal is None:
         goal = _start_pos(env).clone()
-        goal[:, 2] += 0.07
+        goal[:, 2] += 0.05
         setattr(env, GOAL_ATTR, goal)
     return goal
 
@@ -540,3 +540,45 @@ def held_pose_success(env, tolerance_m: float = 0.02, max_speed_mps: float = 0.0
     streak[:] = torch.where(ok, streak + 1.0, torch.zeros_like(streak))
     return streak * env.step_dt >= t_success_s - 1e-6
 
+
+
+# -- v2 lift-and-score: the episode ends when the held box passes 5 cm -----------
+#
+# The goal pose is the box's start pose raised z_lifted_m. At the moment the
+# held box passes that height the episode ends and is scored by how far the box
+# corners are from the goal pose. "success" is the named subset with every
+# corner within success_m (about 10 degrees of tilt).
+
+LIFT_CORNER_ERROR_ATTR = "grasp_lift_corner_error"
+
+
+def _held_lift_event(env, z_lifted_m: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """(lifted this step while held, corner error); computed once per step."""
+    cache = env.__dict__.setdefault("_held_lift_cache", {})
+    step = int(env.common_step_counter)
+    if cache.get("step") != step:
+        error = goal_corner_error(env)
+        fired = _lifted(env, z_lifted_m) & grasp_held(env)
+        record = env.__dict__.setdefault(LIFT_CORNER_ERROR_ATTR, torch.full((env.num_envs,), float("nan"),
+                                                                             device=env.device))
+        record[fired] = error[fired]
+        cache.update(step=step, value=(fired, error))
+    return cache["value"]
+
+
+def lift_success(env, z_lifted_m: float = 0.05, success_m: float = 0.02) -> torch.Tensor:
+    """Termination: held box passed z_lifted_m with every corner within success_m of the goal pose."""
+    fired, error = _held_lift_event(env, z_lifted_m)
+    return fired & (error < success_m)
+
+
+def lift_off_pose(env, z_lifted_m: float = 0.05, success_m: float = 0.02) -> torch.Tensor:
+    """Termination: held box passed z_lifted_m but tilted or shifted beyond success_m."""
+    fired, error = _held_lift_event(env, z_lifted_m)
+    return fired & (error >= success_m)
+
+
+def lift_pose_score(env, z_lifted_m: float = 0.05, scale_m: float = 0.03) -> torch.Tensor:
+    """On the lift step: exp(-corner error / scale_m), 1 for a perfectly upright, unshifted box."""
+    fired, error = _held_lift_event(env, z_lifted_m)
+    return fired.float() * torch.exp(-error / scale_m)
