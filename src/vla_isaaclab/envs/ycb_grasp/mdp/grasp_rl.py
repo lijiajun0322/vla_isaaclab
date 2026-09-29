@@ -13,7 +13,12 @@ import torch
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul, subtract_frame_transforms
 
-from vla_isaaclab.envs.common import GraspObjectSpec, object_up_axis
+from vla_isaaclab.envs.common import (
+    LEFT_HAND_CLOSED_JOINT_POSITIONS,
+    LEFT_HAND_JOINT_NAMES,
+    GraspObjectSpec,
+    object_up_axis,
+)
 
 
 PALM_BODY = "left_hand_palm_link"
@@ -33,6 +38,9 @@ HAND_CONTACT_SENSORS = (
     *FINGER_CONTACT_SENSORS,
 )
 CONTACT_THRESHOLD_N = 0.5
+# Hand/table contact sensors, added only where the task uses them (see add_hand_table_contacts).
+TABLE_CONTACT_SENSORS = tuple(f"table_contact_{short}" for short in (
+    "palm", "thumb_0", "thumb_1", "thumb_2", "index_0", "index_1", "middle_0", "middle_1"))
 
 
 def _object(env) -> RigidObject:
@@ -111,10 +119,30 @@ def fingertips_in_object(env) -> torch.Tensor:
     return local.reshape(env.num_envs, count, 3)
 
 
+# Far end of each distal link in its own frame (thumb, index, middle; from the
+# visual meshes, the links are 52 mm long). The link origins sit at the last joint.
+FINGERTIP_OFFSETS = ((0.0, -0.045, 0.0), (0.045, 0.0, 0.0), (0.045, 0.0, 0.0))
+
+
+def fingertip_points_in_object(env) -> torch.Tensor:
+    """Actual fingertip points (not link origins) in the object frame, (num_envs, 3, 3)."""
+    robot, obj = _robot(env), _object(env)
+    ids = _body_ids(env, FINGERTIP_BODIES)
+    pos, quat = robot.data.body_pos_w[:, ids], robot.data.body_quat_w[:, ids]
+    offsets = pos.new_tensor(FINGERTIP_OFFSETS).expand_as(pos)
+    tips = pos + quat_apply(quat.reshape(-1, 4), offsets.reshape(-1, 3)).reshape(pos.shape)
+    count = tips.shape[1]
+    inv = quat_conjugate(obj.data.root_quat_w).unsqueeze(1).expand(-1, count, -1).reshape(-1, 4)
+    local = quat_apply(inv, (tips - obj.data.root_pos_w.unsqueeze(1)).reshape(-1, 3))
+    return local.reshape(env.num_envs, count, 3)
+
+
 def fingertip_surface_gaps(env) -> torch.Tensor:
     """Fingertip-link distance to the object's collider box (0 inside), (num_envs, 3)."""
+    spec = _spec(env)
     tips = fingertips_in_object(env)
-    outside = (tips.abs() - tips.new_tensor(_spec(env).half_extents_m)).clamp(min=0.0)
+    tips = tips - tips.new_tensor(spec.box_center_m)
+    outside = (tips.abs() - tips.new_tensor(spec.half_extents_m)).clamp(min=0.0)
     return torch.linalg.vector_norm(outside, dim=-1)
 
 
@@ -162,6 +190,29 @@ def hand_contact_force(env, max_force: float = 20.0) -> torch.Tensor:
 def hand_contact_force_clipped(env, max_force: float = 10.0) -> torch.Tensor:
     """Per-link contact force scaled to [0, 1]; the actor sees how hard it presses."""
     return contact_forces(env).clamp(max=max_force) / max_force
+
+
+def table_contact_force(env, max_force: float = 20.0) -> torch.Tensor:
+    """Per-link hand/table contact force scaled to [0, 1] (critic only: a real hand has no such sensor)."""
+    return contact_forces(env, TABLE_CONTACT_SENSORS).clamp(max=max_force) / max_force
+
+
+# -- hand pressing on the table ---------------------------------------------------
+#
+# With the bowl the lower finger starts a few millimetres above the table and can
+# pry the bowl up against it. Light touches are free; pressing costs up to 1 per
+# step, and a crushing press ends the episode.
+
+
+def table_press(env, threshold_n: float = 1.0, max_n: float = 21.0) -> torch.Tensor:
+    """Largest hand-link/table force above threshold_n, scaled to [0, 1] at max_n."""
+    force = contact_forces(env, TABLE_CONTACT_SENSORS).amax(dim=-1)
+    return (force - threshold_n).clamp(min=0.0, max=max_n - threshold_n) / (max_n - threshold_n)
+
+
+def table_crush(env, max_force_n: float = 30.0) -> torch.Tensor:
+    """Termination: a hand link presses on the table harder than max_force_n."""
+    return contact_forces(env, TABLE_CONTACT_SENSORS).amax(dim=-1) > max_force_n
 
 
 # -- progress rewards (DextrAH-G / DexPBT style) -------------------------------
@@ -239,15 +290,27 @@ def _lifted(env, z_lifted_m: float) -> torch.Tensor:
 
 
 def _corners(env, pos: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
-    local = _CORNER_SIGNS.to(pos.device) * pos.new_tensor(_spec(env).half_extents_m)
+    spec = _spec(env)
+    local = _CORNER_SIGNS.to(pos.device) * pos.new_tensor(spec.half_extents_m) + pos.new_tensor(spec.box_center_m)
     count = local.shape[0]
     world = quat_apply(quat.unsqueeze(1).expand(-1, count, -1).reshape(-1, 4), local.repeat(pos.shape[0], 1))
     return world.reshape(pos.shape[0], count, 3) + pos.unsqueeze(1)
 
 
 def goal_corner_error(env) -> torch.Tensor:
-    """Largest collider-box corner distance to the goal pose (m)."""
+    """Largest collider-box corner distance to the goal pose (m).
+
+    A rim object (spec.rim_radius_m > 0, the bowl) is rotationally symmetric, so
+    yaw about its up axis must not count: its error is the collider-center
+    offset plus how far tilting moves a rim point (rim radius x tilt angle).
+    """
     obj = _object(env)
+    spec = _spec(env)
+    if spec.rim_radius_m > 0.0:
+        center = obj.data.root_pos_w.new_tensor(spec.box_center_m).expand_as(obj.data.root_pos_w)
+        current = obj.data.root_pos_w + quat_apply(obj.data.root_quat_w, center)
+        target = _goal(env) + quat_apply(_start_quat(env), center)
+        return torch.linalg.vector_norm(current - target, dim=-1) + spec.rim_radius_m * object_tilt(env)
     current = _corners(env, obj.data.root_pos_w, obj.data.root_quat_w)
     target = _corners(env, _goal(env), _start_quat(env))
     return torch.linalg.vector_norm(current - target, dim=-1).amax(dim=-1)
@@ -301,11 +364,42 @@ def grasp_held(env, min_steps: int = 3) -> torch.Tensor:
 # -- rewards: DextrAH-G (arXiv 2407.02274) progress terms before the lift ----------
 
 
+def fingertip_rim_distances(env) -> torch.Tensor:
+    """Fingertip distance to the object's rim circle (see GraspObjectSpec.rim_radius_m), (num_envs, 3)."""
+    spec = _spec(env)
+    tips = fingertip_points_in_object(env)
+    axial = tips[..., spec.up_axis] * spec.up_sign
+    radial = torch.linalg.vector_norm(tips, dim=-1).square() - axial.square()
+    radial = radial.clamp(min=0.0).sqrt()
+    return torch.hypot(radial - spec.rim_radius_m, axial - spec.rim_height_m)
+
+
 def dextrah_to_object(env) -> torch.Tensor:
-    """Progress on the summed fingertip distance to the object origin."""
-    tips = _robot(env).data.body_pos_w[:, _body_ids(env, FINGERTIP_BODIES)]
-    distance = torch.linalg.vector_norm((tips - _object(env).data.root_pos_w.unsqueeze(1)).flatten(1), dim=-1)
+    """Progress on the summed fingertip distance to the object origin, or to its rim for a rim grasp."""
+    if _spec(env).rim_radius_m > 0.0:
+        distance = torch.linalg.vector_norm(fingertip_rim_distances(env), dim=-1)
+    else:
+        tips = _robot(env).data.body_pos_w[:, _body_ids(env, FINGERTIP_BODIES)]
+        distance = torch.linalg.vector_norm((tips - _object(env).data.root_pos_w.unsqueeze(1)).flatten(1), dim=-1)
     return _progress_on(env, "to_object", distance)
+
+
+def grasp_contact(env) -> torch.Tensor:
+    """Dense contact reward: 0.25 thumb on the object, 0.25 index or middle, 0.5 more for both (max 1)."""
+    thumb = (contact_forces(env, THUMB_CONTACT_SENSORS).amax(dim=-1) > CONTACT_THRESHOLD_N).float()
+    finger = (contact_forces(env, FINGER_CONTACT_SENSORS).amax(dim=-1) > CONTACT_THRESHOLD_N).float()
+    return 0.25 * thumb + 0.25 * finger + 0.5 * thumb * finger
+
+
+def hand_closure(env) -> torch.Tensor:
+    """Progress on the summed hand-joint distance to the closed pose, until thumb and a finger touch."""
+    cache = env.__dict__.setdefault("_grasp_rl_hand_joints", {})
+    if "ids" not in cache:
+        ids, _ = _robot(env).find_joints(list(LEFT_HAND_JOINT_NAMES), preserve_order=True)
+        cache["ids"] = ids
+        cache["closed"] = torch.tensor(LEFT_HAND_CLOSED_JOINT_POSITIONS, device=env.device)
+    error = (_robot(env).data.joint_pos[:, cache["ids"]] - cache["closed"]).abs().sum(dim=-1)
+    return _progress_on(env, "hand_closure", error, active=~grasp_flag(env))
 
 
 def held_lift(env, z_lifted_m: float = 0.05) -> torch.Tensor:
@@ -320,7 +414,8 @@ def held_lift(env, z_lifted_m: float = 0.05) -> torch.Tensor:
 # The goal pose is the object's start pose raised z_lifted_m. At the moment the
 # held object passes that height the episode ends and is scored by how far the
 # collider corners are from the goal pose. "success" is the named subset with
-# every corner within success_m (about 10 degrees of tilt for the sugar box).
+# every corner within success_m (about 10 degrees of tilt for the sugar box; for
+# the bowl, center offset + rim radius x tilt, about 14 degrees at no offset).
 
 LIFT_CORNER_ERROR_ATTR = "grasp_lift_corner_error"
 

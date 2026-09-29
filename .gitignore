@@ -9,10 +9,14 @@ assets/YCB/dinnerware/029_plate/
 # Isaac Lab is a pinned upstream checkout with its own Git repository.
 /IsaacLab/
 
+# Local agent instructions
+AGENTS.md
+
 # Python/editor artifacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.egg-info/
 .vscode/
 .idea/
 

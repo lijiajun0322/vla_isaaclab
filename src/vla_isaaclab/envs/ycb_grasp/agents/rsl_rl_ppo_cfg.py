@@ -47,3 +47,8 @@ class SugarBoxGraspLiftPPORunnerCfg(GraspLiftPPORunnerCfg):
 @configclass
 class MustardBottleGraspLiftPPORunnerCfg(GraspLiftPPORunnerCfg):
     experiment_name = "grasp_lift_006_mustard_bottle"
+
+
+@configclass
+class BowlGraspLiftPPORunnerCfg(GraspLiftPPORunnerCfg):
+    experiment_name = "grasp_lift_024_bowl"

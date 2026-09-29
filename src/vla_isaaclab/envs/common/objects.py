@@ -22,6 +22,7 @@ from .scene import SUPPORT_HEIGHT
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 YCB_USD_DIR = PROJECT_ROOT / "assets/YCB/Axis_Aligned_Physics"
+DINNERWARE_USD_DIR = PROJECT_ROOT / "assets/YCB/dinnerware"
 
 
 @configclass
@@ -31,6 +32,8 @@ class GraspObjectSpec:
     usd_path: str = ""
     half_extents_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     """Collider half extents along the object's root x, y, z axes."""
+    box_center_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Center of that collider box in the root frame (the bowl's root is its bottom)."""
     up_axis: int = 2
     """Root axis that points up (times up_sign) while the object rests upright on the table."""
     up_sign: float = 1.0
@@ -63,6 +66,11 @@ class GraspObjectSpec:
 
     hand_preshape: dict[str, float] = {}
     """Safe finger curl at the pregrasp (rad magnitudes): thumb_rotate, thumb, index, middle."""
+
+    rim_radius_m: float = 0.0
+    """Nonzero for a rim grasp: RL rewards fingertips for approaching the rim circle
+    (this radius about the up axis, at rim_height_m) instead of the root."""
+    rim_height_m: float = 0.0
 
 
 def object_up_axis(spec: GraspObjectSpec, quat: torch.Tensor) -> torch.Tensor:
@@ -145,4 +153,43 @@ MUSTARD_BOTTLE = GraspObjectSpec(
     ),
     grasp_away_shift_m=SUGAR_BOX.grasp_away_shift_m,
     hand_preshape=dict(SUGAR_BOX.hand_preshape),
+)
+
+
+# Mesh bounds 161 x 161 x 55 mm, root at the bottom center (the converter moves
+# the mesh's lowest point to z = 0), up is local +z. Wall ~4 mm thick, 70-73 mm
+# radius up to 47 mm high, then a lip flares out to 81 mm at 48-55 mm.
+# Rim pinch on the robot's left of the bowl: fingers point forward along the
+# rim outside the bowl, thumb inside it. Found with
+#   scripts/rl/probe_rim_pregrasp.sh --frame forward --anchor thumb
+#     --rim-point 0.062 0.048 --phi-deg 200 --pitch-deg 35 --roll-deg 12
+#     --radial-m -0.06 --object-dy-m 0.03 --support-dz-m 0.06
+# (bowl default then 11 cm left of the sugar box). That palm target overlaps
+# the bowl, which the hold pushes 4 cm away; the values below are the settled,
+# untouched result (hand pose relative to where the bowl came to rest), from
+# which closing and raising the palm lifted the bowl 6.8 cm at 9 deg tilt.
+# The table is 6 cm higher so the arm reaches the lowered wrist.
+BOWL = GraspObjectSpec(
+    name="024_bowl",
+    usd_path=str(DINNERWARE_USD_DIR / "024_bowl/024_bowl_physics.usd"),
+    half_extents_m=(0.0807, 0.0806, 0.0275),
+    box_center_m=(0.0, 0.0, 0.0275),
+    up_axis=2,
+    pinch_axis=2,
+    rest_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+    rest_half_height_m=0.0,
+    initial_xy=(-0.094827, -0.250232),
+    support_height_m=SUPPORT_HEIGHT + 0.06,
+    dr_x_range_m=(-0.01, 0.01),
+    dr_y_range_m=(-0.01, 0.01),
+    # Rotationally symmetric: yaw changes nothing.
+    turn_point_world=(-0.081527, -0.446395, 0.903563),
+    grasp_quat_wxyz=(0.390657, -0.193817, 0.194189, 0.8787),
+    grasp_offset_world=(-0.009365, -0.133352, 0.118871),
+    # 0.1 rad short of first contact when closing from the open hand
+    # (scripts/rl/preview_preshape.sh, 5 % quantile: thumb 0.62, index 0.32,
+    # middle 0.42); the thumb stays a little further open than that.
+    hand_preshape={"thumb_rotate": 0.2, "thumb": 0.55, "index": 0.22, "middle": 0.32},
+    rim_radius_m=0.076,
+    rim_height_m=0.052,
 )

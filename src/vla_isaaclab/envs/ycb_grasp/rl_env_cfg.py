@@ -26,6 +26,7 @@ from isaaclab.utils import configclass
 from vla_isaaclab.rl.pregrasp_table import pregrasp_table_path, reset_from_pregrasp_table
 
 from ..common import (
+    BOWL,
     LEFT_ARM_JOINT_NAMES,
     LEFT_END_EFFECTOR,
     LEFT_HAND_JOINT_NAMES,
@@ -34,7 +35,7 @@ from ..common import (
     SUPPORT_HEIGHT,
     GraspObjectSpec,
 )
-from .env_cfg import YCBGraspStateEnvCfg
+from .env_cfg import YCBGraspStateEnvCfg, add_hand_table_contacts
 from .mdp import grasp_rl, invalid_state, object_fallen
 
 
@@ -187,10 +188,45 @@ class MustardBottleGraspLiftEnvCfg(YCBGraspLiftEnvCfg):
 
 
 @configclass
+class BowlGraspLiftEnvCfg(YCBGraspLiftEnvCfg):
+    """The bowl's pregrasp puts the lower finger just above the table. With
+    table_penalty, pressing on it is penalized (from 1 N, full cost at 21 N) and
+    ends the episode above 30 N, so the policy pinches the rim instead of prying
+    the bowl up.
+
+    The shared rewards gave no signal from the backed-off pregrasp (nothing
+    lifted in 200 fast iterations), so the bowl adds two shaping terms toward
+    the first grasp: progress in closing the hand (until thumb and a finger
+    touch) and a dense per-step contact reward."""
+
+    object_spec: GraspObjectSpec = BOWL
+    table_penalty: bool = False
+    """Add the table-press penalty and table-crush termination. Off while the
+    policy first learns to lift; the table sensors and the critic's table-force
+    observation stay either way, so a run can resume with it switched on."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_hand_table_contacts(self.scene)
+        self.observations.critic.table_contact_force = ObsTerm(func=grasp_rl.table_contact_force)
+        if self.table_penalty:
+            self.rewards.table_press = RewTerm(func=grasp_rl.table_press, weight=-0.1,
+                                               params={"threshold_n": 1.0, "max_n": 21.0})
+            self.terminations.table_crush = DoneTerm(func=grasp_rl.table_crush, params={"max_force_n": 30.0})
+        self.rewards.hand_closure = RewTerm(func=grasp_rl.hand_closure, weight=5.0)
+        self.rewards.grasp_contact = RewTerm(func=grasp_rl.grasp_contact, weight=0.1)
+
+
+@configclass
 class SugarBoxGraspLiftFastEnvCfg(SugarBoxGraspLiftEnvCfg):
     fast_actions: bool = True
 
 
 @configclass
 class MustardBottleGraspLiftFastEnvCfg(MustardBottleGraspLiftEnvCfg):
+    fast_actions: bool = True
+
+
+@configclass
+class BowlGraspLiftFastEnvCfg(BowlGraspLiftEnvCfg):
     fast_actions: bool = True

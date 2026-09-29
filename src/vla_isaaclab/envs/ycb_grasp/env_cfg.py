@@ -57,6 +57,29 @@ def _hand_object_contacts(link: str) -> ContactSensorCfg:
     )
 
 
+# Hand links that can press on the table, by the short name used in sensor names.
+HAND_LINKS = {
+    "palm": "left_hand_palm_link",
+    "thumb_0": "left_hand_thumb_0_link",
+    "thumb_1": "left_hand_thumb_1_link",
+    "thumb_2": "left_hand_thumb_2_link",
+    "index_0": "left_hand_index_0_link",
+    "index_1": "left_hand_index_1_link",
+    "middle_0": "left_hand_middle_0_link",
+    "middle_1": "left_hand_middle_1_link",
+}
+
+
+def add_hand_table_contacts(scene) -> None:
+    """One table_contact_<link> sensor per hand link, filtered to the table top."""
+    for short, link in HAND_LINKS.items():
+        setattr(scene, f"table_contact_{short}", ContactSensorCfg(
+            prim_path=f"{{ENV_REGEX_NS}}/Robot/{link}",
+            filter_prim_paths_expr=["{ENV_REGEX_NS}/SupportSurface"],
+            history_length=4,
+        ))
+
+
 def _gravity_free_g1_cfg():
     # The relative differential-IK action re-targets the measured palm pose every
     # step, so under gravity a PD-held arm creeps down (~9 cm in 5 s at zero

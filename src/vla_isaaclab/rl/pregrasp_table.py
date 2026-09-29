@@ -95,13 +95,15 @@ def pregrasp_palm_target(spec: GraspObjectSpec, box_pos, box_quat, nominal_quat,
     yaw_quat = box_yaw_quat(box_quat, nominal_quat)
     grasp_quat = quat_mul(yaw_quat, box_quat.new_tensor(spec.grasp_quat_wxyz).expand_as(box_quat))
     approach = quat_apply(grasp_quat, _axis(box_quat, 0))
-    thickness_axis = quat_apply(box_quat, _axis(box_quat, spec.pinch_axis))
-    thickness_axis[:, 2] = 0.0
-    thickness_axis = thickness_axis / torch.linalg.vector_norm(thickness_axis, dim=-1, keepdim=True)
-    away = box_pos - robot_root_pos
-    away_axis = torch.where((thickness_axis * away).sum(-1, keepdim=True) < 0.0, -thickness_axis, thickness_axis)
     offset = quat_apply(yaw_quat, box_pos.new_tensor(spec.grasp_offset_world).expand_as(box_pos))
-    offset = offset + spec.grasp_away_shift_m * away_axis
+    # A vertical pinch axis (the bowl's rim pinch) has no horizontal direction to shift along.
+    if spec.grasp_away_shift_m != 0.0:
+        thickness_axis = quat_apply(box_quat, _axis(box_quat, spec.pinch_axis))
+        thickness_axis[:, 2] = 0.0
+        thickness_axis = thickness_axis / torch.linalg.vector_norm(thickness_axis, dim=-1, keepdim=True)
+        away = box_pos - robot_root_pos
+        away_axis = torch.where((thickness_axis * away).sum(-1, keepdim=True) < 0.0, -thickness_axis, thickness_axis)
+        offset = offset + spec.grasp_away_shift_m * away_axis
     position = box_pos + offset - backoff_m.unsqueeze(-1) * approach
     return position, grasp_quat, approach
 

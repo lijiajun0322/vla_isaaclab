@@ -32,6 +32,7 @@ OUTCOME_LABELS = {
     "success": "success",
     "lifted_off_pose": "lifted, off pose",
     "fell": "object fell",
+    "table_crush": "hand crushed table",
     "invalid_state": "invalid state",
     "time_out": "timed out",
 }

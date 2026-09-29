@@ -14,7 +14,7 @@ from .g1 import (
     make_g1_cfg,
 )
 from .base import VLAEnvCfg
-from .objects import MUSTARD_BOTTLE, PROJECT_ROOT, SUGAR_BOX, GraspObjectSpec, object_rigid_cfg, object_up_axis
+from .objects import BOWL, MUSTARD_BOTTLE, PROJECT_ROOT, SUGAR_BOX, GraspObjectSpec, object_rigid_cfg, object_up_axis
 from .managers import EventsCfg, JointLimitActionsCfg, PreviewObservationsCfg, PreviewRewardsCfg, PreviewTerminationsCfg
 from .scene import (
     SUPPORT_HEIGHT,
@@ -29,6 +29,7 @@ from .scene import (
 
 __all__ = [
     "ACTION_JOINT_NAMES",
+    "BOWL",
     "CONTRACT_JOINT_NAMES",
     "EventsCfg",
     "GraspObjectSpec",

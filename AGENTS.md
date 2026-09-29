@@ -34,6 +34,10 @@ check_install_environment
 - Never claim task success unless its named success termination fires.
 - Never save or label a failed manipulation as a successful demonstration.
 - If the same task reproduction fails three times, stop and request human inspection.
+- Report problems to the user as soon as they come up (a crash, an approach that
+  does not work, a result that contradicts the plan): say what happened, what
+  you tried and the options, then wait. Do not keep debugging or switching
+  approaches on your own for long stretches.
 
 ## Architecture
 

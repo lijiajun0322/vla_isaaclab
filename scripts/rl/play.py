@@ -43,6 +43,10 @@ parser.add_argument("--stochastic", action="store_true",
                     help="Sample actions with the policy's exploration noise, as in training (default: mean action).")
 parser.add_argument("--video-dir", type=Path, default=None,
                     help="Record env 0 from the side and left-wrist cameras into this directory.")
+parser.add_argument("--snapshot-dir", type=Path, default=None,
+                    help="Save link poses at --snapshot-steps for scripts/rl/draw_probe_snapshots.py (no renderer).")
+parser.add_argument("--snapshot-steps", type=int, nargs=3, default=(0, 45, 90), metavar=("START", "MID", "LATE"))
+parser.add_argument("--snapshot-envs", type=int, default=8, help="Envs drawn from the snapshots.")
 AppLauncher.add_app_launcher_args(parser)
 ARGS = parser.parse_args()
 # AppLauncher consumes enable_cameras, so keep our own flag.
@@ -205,6 +209,55 @@ def hold_after_lift(env, base, policy, videos) -> int:
     return 0
 
 
+def link_meshes(base) -> dict:
+    """Left forearm and hand visual meshes in each link's frame (as in probe_rim_pregrasp.py)."""
+    from pxr import Usd, UsdGeom
+
+    root = base.sim.stage.GetPrimAtPath("/World/envs/env_0/Robot")
+    names = [n for n in base.scene["robot"].body_names if n.startswith(("left_elbow", "left_wrist", "left_hand"))]
+    cache = UsdGeom.XformCache()
+    links = {}
+    for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+        if prim.GetName() in names:
+            links.setdefault(prim.GetName(), prim)
+    meshes = {}
+    for name, link in links.items():
+        to_link = cache.GetLocalToWorldTransform(link).GetInverse()
+        verts, faces, offset = [], [], 0
+        for prim in Usd.PrimRange(link, Usd.TraverseInstanceProxies()):
+            if not prim.IsA(UsdGeom.Mesh) or "collision" in str(prim.GetPath()).lower():
+                continue
+            mesh = UsdGeom.Mesh(prim)
+            points = mesh.GetPointsAttr().Get()
+            if not points:
+                continue
+            counts, indices = mesh.GetFaceVertexCountsAttr().Get(), mesh.GetFaceVertexIndicesAttr().Get()
+            matrix = cache.GetLocalToWorldTransform(prim) * to_link
+            verts.append(np.array([matrix.Transform(pt) for pt in points], dtype=np.float32))
+            start = 0
+            for count in counts:
+                faces.extend((indices[start] + offset, indices[start + k] + offset, indices[start + k + 1] + offset)
+                             for k in range(1, count - 1))
+                start += count
+            offset += len(points)
+        if verts:
+            meshes[name] = (np.concatenate(verts), np.array(faces, dtype=np.int64))
+    return meshes
+
+
+def save_snapshot(base, tag: str):
+    robot, obj = base.scene["robot"], base.scene["object"]
+    origins = base.scene.env_origins
+    ARGS.snapshot_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "body_names": robot.body_names,
+        "body_pos": (robot.data.body_pos_w - origins.unsqueeze(1)).cpu(),
+        "body_quat": robot.data.body_quat_w.cpu(),
+        "object_pos": (obj.data.root_pos_w - origins).cpu(),
+        "object_quat": obj.data.root_quat_w.cpu(),
+    }, ARGS.snapshot_dir / f"{tag}.pt")
+
+
 def main() -> int:
     env_cfg = parse_env_cfg(ARGS.task, device=ARGS.device, num_envs=ARGS.num_envs)
     env_cfg.seed = ARGS.seed
@@ -242,10 +295,25 @@ def main() -> int:
         longest = torch.zeros(base.num_envs, device=base.device)
         if ARGS.hold_after_lift_s is not None:
             return hold_after_lift(env, base, policy, videos)
+        # Hand/table contact, where the task has the sensors (the bowl).
+        has_table = all(name in base.scene.sensors for name in grasp_rl.TABLE_CONTACT_SENSORS)
+        max_table_force = torch.zeros(n, device=base.device)
+        lift_touching = torch.zeros(n, len(grasp_rl.HAND_CONTACT_SENSORS), device=base.device)
+        lift_table_force = torch.full((n,), float("nan"), device=base.device)
+        lift_tilt = torch.full((n,), float("nan"), device=base.device)
+        snapshot_tags = dict(zip(ARGS.snapshot_steps, ("0_pregrasp", "1_mid", "2_late")))
         with torch.inference_mode():
             base.reset()
             obs, _ = env.get_observations()
-            for _ in range(base.max_episode_length):
+            for step in range(base.max_episode_length):
+                if ARGS.snapshot_dir is not None and step in snapshot_tags:
+                    save_snapshot(base, snapshot_tags[step])
+                # Read before the step: on the lift step the env resets and the state is gone.
+                if has_table:
+                    table_force = grasp_rl.contact_forces(base, grasp_rl.TABLE_CONTACT_SENSORS).amax(dim=-1)
+                    max_table_force = torch.where(alive, torch.maximum(max_table_force, table_force), max_table_force)
+                pre_touch = grasp_rl.contact_forces(base) > grasp_rl.CONTACT_THRESHOLD_N
+                pre_tilt = grasp_rl.object_tilt(base)
                 obs, _, dones, _ = env.step(policy(obs))
                 if videos is not None and bool(alive[0]):
                     write_frames(base, videos)
@@ -254,6 +322,10 @@ def main() -> int:
                     lifted_now = alive & done & (base.termination_manager.get_term("success")
                                                  | base.termination_manager.get_term("lifted_off_pose"))
                     lift_error[lifted_now] = getattr(base, grasp_rl.LIFT_CORNER_ERROR_ATTR)[lifted_now]
+                    lift_touching[lifted_now] = pre_touch[lifted_now].float()
+                    lift_tilt[lifted_now] = pre_tilt[lifted_now]
+                    if has_table:
+                        lift_table_force[lifted_now] = table_force[lifted_now]
                 for name in outcome:
                     outcome[name] |= alive & done & base.termination_manager.get_term(name)
                 # Terminal-step state is already reset; score only continuing steps.
@@ -302,6 +374,16 @@ def main() -> int:
                 q: torch.nanquantile(lift_error, q).item() * 1e3 for q in (0.1, 0.5, 0.9)},
             "lift_score_mean": None if bool(lift_error.isnan().all()) else
                 torch.exp(-lift_error[~lift_error.isnan()] / 0.03).mean().item() * 100,
+            # One step before the lift: which hand links touched the object, object tilt, table force.
+            "lift_links_touching_fraction": None if bool(lift_error.isnan().all()) else {
+                name[len("object_contact_"):]: lift_touching[~lift_error.isnan(), i].mean().item()
+                for i, name in enumerate(grasp_rl.HAND_CONTACT_SENSORS)},
+            "lift_tilt_deg": None if bool(lift_tilt.isnan().all()) else {
+                q: math.degrees(torch.nanquantile(lift_tilt, q).item()) for q in (0.1, 0.5, 0.9)},
+            "max_table_force_n": None if not has_table else {
+                q: max_table_force.quantile(q).item() for q in (0.5, 0.9, 0.99)},
+            "lift_table_force_n": None if not has_table or bool(lift_table_force.isnan().all()) else {
+                q: torch.nanquantile(lift_table_force, q).item() for q in (0.5, 0.9, 0.99)},
             "success_source": "success termination" if "success" in outcome else "play.py hold rule",
             "success_definition": {"height_m": ARGS.success_height_m, "tilt_deg": ARGS.success_tilt_deg,
                                    "hold_steps": ARGS.success_hold_steps},
@@ -309,6 +391,17 @@ def main() -> int:
             "videos": None if videos is None else [str(ARGS.video_dir / f"{c}.mp4") for c in VIDEO_CAMERAS],
         }
         print(json.dumps(report, indent=2), flush=True)
+        if ARGS.snapshot_dir is not None:
+            spec = base.cfg.object_spec
+            torch.save({"meshes": link_meshes(base), "support_height_m": spec.support_height_m,
+                        "object_usd": spec.usd_path}, ARGS.snapshot_dir / "geometry.pt")
+            rows = [{"env": i, "phi": 200.0,
+                     "title": f"env {i}: {'success' if bool(success[i]) else 'no success'}, "
+                              f"peak lift {peak_lift[i].item() * 1e3:.0f} mm, "
+                              f"max table force {max_table_force[i].item():.1f} N; "
+                              f"stages = steps {', '.join(map(str, ARGS.snapshot_steps))}"}
+                    for i in range(min(ARGS.snapshot_envs, n))]
+            (ARGS.snapshot_dir / "rows.json").write_text(json.dumps(rows, indent=1) + "\n")
         out = ARGS.checkpoint.with_name(ARGS.checkpoint.stem + ("_stochastic" if ARGS.stochastic else "") + "_eval.json")
         out.write_text(json.dumps(report, indent=2) + "\n")
         return 0

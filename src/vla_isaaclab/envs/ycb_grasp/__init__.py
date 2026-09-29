@@ -13,6 +13,7 @@ import gymnasium as gym
 OBJECTS = {
     "SugarBox": ("SugarBoxGraspLiftEnvCfg", "SugarBoxGraspLiftPPORunnerCfg"),
     "MustardBottle": ("MustardBottleGraspLiftEnvCfg", "MustardBottleGraspLiftPPORunnerCfg"),
+    "Bowl": ("BowlGraspLiftEnvCfg", "BowlGraspLiftPPORunnerCfg"),
 }
 
 
