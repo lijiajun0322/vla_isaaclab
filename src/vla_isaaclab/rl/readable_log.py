@@ -14,6 +14,10 @@ printed rates weight each outcome by its episode duration, which estimates the
 share of started episodes ending that way (exact for a fixed policy; the
 episode running at the start of training is counted from there). They go to
 TensorBoard as ``Outcome/<term>``; ``verbose=True`` also prints RSL-RL's block.
+
+With ``log_file`` the same summary, plus each reward term's mean over the
+episodes that ended this iteration, is appended to that file and flushed every
+iteration, so it can be followed live (``tail -f``).
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import contextlib
 import io
 import statistics
 import time
+from pathlib import Path
 
 import torch
 from rsl_rl.runners import OnPolicyRunner
@@ -39,9 +44,14 @@ OUTCOME_LABELS = {
 
 
 class ReadableOnPolicyRunner(OnPolicyRunner):
-    def __init__(self, env, train_cfg: dict, log_dir: str | None = None, device: str = "cpu", verbose: bool = False):
+    def __init__(self, env, train_cfg: dict, log_dir: str | None = None, device: str = "cpu", verbose: bool = False,
+                 log_file: str | None = None):
         super().__init__(env, train_cfg, log_dir=log_dir, device=device)
         self.verbose = verbose
+        self.log_file = None
+        if log_file is not None:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            self.log_file = open(log_file, "a", buffering=1)
         self.step_dt = env.unwrapped.step_dt
         manager = env.unwrapped.termination_manager
         # An episode flagged by several terms in one step counts once: for the
@@ -106,3 +116,22 @@ class ReadableOnPolicyRunner(OnPolicyRunner):
             + f"action noise std {self.alg.actor_critic.std.mean().item():.2f}",
         ]
         print("\n".join(lines), flush=True)
+        if self.log_file is not None:
+            rewards = self._episode_rewards(locs)
+            if rewards:
+                # Isaac Lab logs each term's episode sum divided by the max episode length (s).
+                lines.append("  reward terms (episode sum / max episode s): "
+                             + " | ".join(f"{name} {value:.4f}" for name, value in rewards.items()))
+            self.log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] " + "\n".join(lines) + "\n")
+            self.log_file.flush()
+
+    @staticmethod
+    def _episode_rewards(locs: dict) -> dict[str, float]:
+        """Mean of each Episode_Reward/<term> over the episodes that ended this iteration."""
+        values: dict[str, list[float]] = {}
+        for info in locs.get("ep_infos") or []:
+            for key, value in info.items():
+                if key.startswith("Episode_Reward/"):
+                    value = torch.as_tensor(value, dtype=torch.float32).flatten()
+                    values.setdefault(key[len("Episode_Reward/"):], []).extend(value.tolist())
+        return {name: statistics.mean(v) for name, v in values.items() if v}

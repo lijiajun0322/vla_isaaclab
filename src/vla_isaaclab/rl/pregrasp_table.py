@@ -51,14 +51,19 @@ def pregrasp_table_path(spec: GraspObjectSpec, open_hand: bool = False) -> Path:
     return PREGRASP_TABLE_DIR / spec.name / f"pregrasp_table_{'open' if open_hand else 'preshape'}.pt"
 
 
-def hand_preshape_joint_pos(thumb_rotate: float, thumb: float, index: float, middle: float) -> dict[str, float]:
-    """Left-hand joint targets by name; each curl follows its closed-pose sign."""
+def hand_preshape_joint_pos(thumb_rotate: float, thumb: float, index: float, middle: float,
+                            side: str = "left") -> dict[str, float]:
+    """Hand joint targets by name; each curl follows its closed-pose sign.
+
+    The right Dex3 is the left one mirrored: every joint closes in the opposite
+    direction (its USD limits are the left ones negated).
+    """
     closed = dict(zip(LEFT_HAND_JOINT_NAMES, LEFT_HAND_CLOSED_JOINT_POSITIONS))
+    mirror = {"left": 1.0, "right": -1.0}[side]
     curl = {"thumb_1": thumb, "thumb_2": thumb, "index_0": index, "index_1": index, "middle_0": middle, "middle_1": middle}
-    targets = {"left_hand_thumb_0_joint": math.copysign(thumb_rotate, closed["left_hand_thumb_0_joint"])}
+    targets = {f"{side}_hand_thumb_0_joint": mirror * math.copysign(thumb_rotate, closed["left_hand_thumb_0_joint"])}
     for short, value in curl.items():
-        name = f"left_hand_{short}_joint"
-        targets[name] = math.copysign(value, closed[name])
+        targets[f"{side}_hand_{short}_joint"] = mirror * math.copysign(value, closed[f"left_hand_{short}_joint"])
     return targets
 
 
@@ -111,13 +116,17 @@ def pregrasp_palm_target(spec: GraspObjectSpec, box_pos, box_quat, nominal_quat,
 class ArmKinematics:
     """Batched kinematic IK for waist yaw + left arm; nothing is simulated."""
 
-    def __init__(self, env, orientation_weight: float = 0.3, damping: float = 0.03):
+    def __init__(self, env, orientation_weight: float = 0.3, damping: float = 0.03,
+                 joint_names: tuple[str, ...] = ARM_JOINT_NAMES, end_effector: str = LEFT_END_EFFECTOR):
+        """Defaults to waist yaw + left arm; pass another chain (e.g. the right arm alone) to solve it instead."""
         self.env = env
         self.robot = env.scene["robot"]
-        self.arm_joint_ids, found = self.robot.find_joints(list(ARM_JOINT_NAMES), preserve_order=True)
-        if list(found) != list(ARM_JOINT_NAMES):
-            raise RuntimeError(f"Arm joint mismatch: expected {ARM_JOINT_NAMES}, found {found}")
-        palm_ids, _ = self.robot.find_bodies([LEFT_END_EFFECTOR], preserve_order=True)
+        self.arm_joint_ids, found = self.robot.find_joints(list(joint_names), preserve_order=True)
+        if list(found) != list(joint_names):
+            raise RuntimeError(f"Arm joint mismatch: expected {joint_names}, found {found}")
+        # Only a chain starting at waist yaw gets the waist bound below.
+        self.has_waist = joint_names[0] == WAIST_JOINT_NAMES[0]
+        palm_ids, _ = self.robot.find_bodies([end_effector], preserve_order=True)
         self.palm_body_id = palm_ids[0]
         self.palm_jacobian_id = self.palm_body_id - 1 if self.robot.is_fixed_base else self.palm_body_id
         self.orientation_weight = orientation_weight
@@ -125,9 +134,10 @@ class ArmKinematics:
         self.base_joint_pos = self.robot.data.default_joint_pos.clone()
         limits = self.robot.data.soft_joint_pos_limits[:, self.arm_joint_ids]
         self.lower, self.upper = limits[..., 0].clone(), limits[..., 1].clone()
-        waist_center = self.base_joint_pos[:, self.arm_joint_ids[0]]
-        self.lower[:, 0] = torch.maximum(self.lower[:, 0], waist_center - MAX_WAIST_YAW_DEVIATION_RAD)
-        self.upper[:, 0] = torch.minimum(self.upper[:, 0], waist_center + MAX_WAIST_YAW_DEVIATION_RAD)
+        if self.has_waist:
+            waist_center = self.base_joint_pos[:, self.arm_joint_ids[0]]
+            self.lower[:, 0] = torch.maximum(self.lower[:, 0], waist_center - MAX_WAIST_YAW_DEVIATION_RAD)
+            self.upper[:, 0] = torch.minimum(self.upper[:, 0], waist_center + MAX_WAIST_YAW_DEVIATION_RAD)
         self.use_finite_difference = False
 
     def set_hand(self, targets: dict[str, float]) -> None:
@@ -193,13 +203,14 @@ class ArmKinematics:
         pos_err, rot_err = compute_pose_error(pos, quat, target_pos, target_quat, rot_error_type="axis_angle")
         # Waist yaw only has to stay inside its IK bound (enforced above); RL keeps
         # it fixed, so only the seven arm joints need room to move.
-        margin, limiting_joint = torch.minimum(arm_q - self.lower, self.upper - arm_q)[:, 1:].min(dim=-1)
-        limiting_joint = limiting_joint + 1
+        first = 1 if self.has_waist else 0
+        margin, limiting_joint = torch.minimum(arm_q - self.lower, self.upper - arm_q)[:, first:].min(dim=-1)
+        limiting_joint = limiting_joint + first
         return arm_q, {
             "ik_position_error_m": torch.linalg.vector_norm(pos_err, dim=-1),
             "ik_rotation_error_rad": torch.linalg.vector_norm(rot_err, dim=-1),
             "joint_limit_margin_rad": margin,
-            # Index into ARM_JOINT_NAMES of the joint closest to its limit.
+            # Index into joint_names of the joint closest to its limit.
             "limiting_joint": limiting_joint.float(),
         }
 

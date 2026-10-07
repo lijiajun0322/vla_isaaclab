@@ -60,6 +60,12 @@ Gym ID -> EnvCfg -> Scene + Isaac Lab Managers -> normalized action -> robot
   object (`VLA-YCBGraspLift-<Object>-G1-v0`), plus a `-Fast-v0` variant with
   5x speed limits for training from scratch before the slow fine-tune.
 - `rl/`: RL support such as the per-object pregrasp state table and its reset event.
+- `envs/bowl_pivot/`: bimanual RL task `VLA-BowlPivot-G1-Bimanual-v0`: both arms
+  (relative DiffIK) and both Dex3 hands turn an upside-down bowl upright, at 2/3 of
+  the grasp-lift fast speed limits (`-Fast-v0`: full fast, where the policy tosses the
+  bowl; `-HalfSpeed-v0`: 1/2). One
+  fixed start state, `outputs/rl/024_bowl/bowl_pivot_init.pt`, built by
+  `./scripts/rl/build_bowl_pivot_init.sh --headless` in the pregrasp-table format.
 
 Use Isaac Lab `JointPositionToLimitsActionCfg` for the 43-D normalized action.
 Its mapping is `-1=soft lower limit`, `0=midpoint`, `+1=soft upper limit`.

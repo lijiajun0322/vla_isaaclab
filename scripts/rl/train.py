@@ -21,6 +21,7 @@ parser.add_argument("--task", default="VLA-YCBGraspLift-SugarBox-G1-v0")
 parser.add_argument("--num-envs", type=int, default=2048)
 parser.add_argument("--max-iterations", type=int, default=None)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--save-interval", type=int, default=None, help="Checkpoint every N iterations (default: runner cfg).")
 parser.add_argument("--run-name", default="")
 parser.add_argument("--resume", type=Path, default=None, help="Checkpoint (.pt) to continue from.")
 parser.add_argument("--log-root", type=Path, default=PROJECT_ROOT / "outputs/rl/runs")
@@ -54,6 +55,8 @@ def main() -> int:
     agent_cfg.device = ARGS.device
     if ARGS.max_iterations is not None:
         agent_cfg.max_iterations = ARGS.max_iterations
+    if ARGS.save_interval is not None:
+        agent_cfg.save_interval = ARGS.save_interval
     env_cfg.seed = agent_cfg.seed
 
     run = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + (f"_{ARGS.run_name}" if ARGS.run_name else "")
@@ -62,8 +65,9 @@ def main() -> int:
 
     env = ClippedRslRlVecEnvWrapper(gym.make(ARGS.task, cfg=env_cfg))
     try:
+        # Live per-iteration progress, reward terms and outcome shares in the run directory.
         runner = ReadableOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=str(log_dir), device=agent_cfg.device,
-                                        verbose=ARGS.verbose_log)
+                                        verbose=ARGS.verbose_log, log_file=str(log_dir / "train.log"))
         runner.add_git_repo_to_log(__file__)
         if ARGS.resume is not None:
             print(f"[train] resuming from {ARGS.resume}", flush=True)
