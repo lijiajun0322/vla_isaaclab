@@ -5,6 +5,8 @@ from pathlib import Path
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
+from isaaclab.sim.spawners.from_files import spawn_from_usd
+from isaaclab.sim.utils import clone
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -225,3 +227,56 @@ def make_g1_cfg(
     cfg.init_state.joint_pos.update(LEFT_ARM_HOME_JOINT_POSITIONS)
     cfg.init_state.joint_pos.update(dict(zip(LEFT_HAND_JOINT_NAMES, LEFT_HAND_OPEN_JOINT_POSITIONS)))
     return cfg
+
+
+# -- self-collision --------------------------------------------------------------
+#
+# The asset spawns with self-collision off, so an arm can pass through the torso.
+# Switching it on also turns on contacts that are artifacts of the asset:
+# - each wrist camera bracket against the palm, thumb and wrist links (all rigidly
+#   attached to the same wrist_yaw_link; PhysX only excludes parent-child pairs),
+#   thousands of newtons in the default pose, and against the elbow link when the
+#   wrist bends;
+# - wrist_roll against wrist_yaw (one joint apart, overlapping hulls at some angles).
+# Those pairs are filtered per arm; every other self-collision (arm vs torso, arm vs
+# arm, hand vs hand, ...) stays on.
+
+HAND_CAMERA_FILTERED_LINKS = (
+    "elbow_link", "wrist_roll_link", "wrist_pitch_link", "wrist_yaw_link", "hand_palm_link",
+    "hand_thumb_0_link", "hand_thumb_1_link", "hand_thumb_2_link",
+    "hand_index_0_link", "hand_index_1_link", "hand_middle_0_link", "hand_middle_1_link",
+)
+# Further non-adjacent pairs inside one forearm/wrist.
+WRIST_FILTERED_PAIRS = (("wrist_roll_link", "wrist_yaw_link"), ("elbow_link", "wrist_pitch_link"),
+                        ("elbow_link", "wrist_yaw_link"))
+
+
+def filter_hand_camera_collisions(robot_path: str) -> None:
+    """Filter each side's camera bracket against its forearm, wrist and hand links, and the wrist pairs above."""
+    from pxr import UsdPhysics
+    import isaacsim.core.utils.stage as stage_utils
+
+    stage = stage_utils.get_current_stage()
+    for side in ("left", "right"):
+        camera = stage.GetPrimAtPath(f"{robot_path}/{side}_hand_camera_base_link")
+        if not camera.IsValid():
+            raise RuntimeError(f"No {side}_hand_camera_base_link under {robot_path}")
+        pairs = UsdPhysics.FilteredPairsAPI.Apply(camera).CreateFilteredPairsRel()
+        for link in HAND_CAMERA_FILTERED_LINKS:
+            pairs.AddTarget(f"{robot_path}/{side}_{link}")
+        for first, second in WRIST_FILTERED_PAIRS:
+            prim = stage.GetPrimAtPath(f"{robot_path}/{side}_{first}")
+            UsdPhysics.FilteredPairsAPI.Apply(prim).CreateFilteredPairsRel().AddTarget(f"{robot_path}/{side}_{second}")
+
+
+@clone
+def _spawn_g1_with_filtered_camera_pairs(prim_path, cfg, translation=None, orientation=None, **kwargs):
+    prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation, orientation, **kwargs)
+    filter_hand_camera_collisions(prim_path)
+    return prim
+
+
+def enable_g1_self_collisions(robot_cfg: ArticulationCfg) -> None:
+    """Self-collision on, with the wrist camera brackets' collisions with their own wrist and hand removed."""
+    robot_cfg.spawn.articulation_props.enabled_self_collisions = True
+    robot_cfg.spawn.func = _spawn_g1_with_filtered_camera_pairs

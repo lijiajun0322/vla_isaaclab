@@ -9,6 +9,10 @@ moment; it passes if the IK is exact, the bowl did not move and no hand or arm
 link touched anything. The hands go to the closest passing distance plus the
 cfg's clearance. That state is saved in the pregrasp-table format (one row), so
 the task resets with the grasp-lift ``reset_from_pregrasp_table``.
+
+A second stage then keeps those hands and moves the bowl to random offsets in
+the cfg's bowl_init_{x,y}_range_m, holds each one still, and saves the offsets
+where the bowl rests untouched as bowl_pivot_init_random.pt (--random-rows).
 """
 
 from __future__ import annotations
@@ -44,6 +48,10 @@ parser.add_argument("--max-contact-force-n", type=float, default=1.0,
                     help="Any hand link on the bowl, or any arm/hand link on anything.")
 parser.add_argument("--max-settled-palm-m", type=float, default=0.01)
 parser.add_argument("--output", type=Path, default=None, help="Default: outputs/rl/024_bowl/bowl_pivot_init.pt")
+parser.add_argument("--random-rows", type=int, default=2000,
+                    help="Accepted randomized bowl starts to collect (0: skip the randomized table).")
+parser.add_argument("--max-random-batches", type=int, default=100)
+parser.add_argument("--seed", type=int, default=0)
 AppLauncher.add_app_launcher_args(parser)
 ARGS = parser.parse_args()
 ARGS.enable_cameras = False
@@ -96,6 +104,76 @@ def palm_quat(cfg, side: str, count: int, device) -> torch.Tensor:
     y_axis = torch.tensor([[0.0, 1.0, 0.0]], device=device).repeat(count, 1)
     angle = torch.full((count,), -SIDE_SIGN[side] * math.radians(cfg.precontact_palm_tilt_deg), device=device)
     return quat_mul(quat_from_angle_axis(angle, y_axis), base)
+
+
+def random_table(env, cfg, q_row, bowl_state_local, output: Path):
+    """Fixed hands, bowl at random offsets; keep the offsets where it rests untouched."""
+    robot, bowl = env.scene["robot"], env.scene["object"]
+    count, device = env.num_envs, env.device
+    q = q_row.to(device).expand(count, -1).clone()
+    ranges = torch.tensor((cfg.bowl_init_x_range_m, cfg.bowl_init_y_range_m), device=device)
+    torch.manual_seed(ARGS.seed)
+    kept = {"joint_pos": [], "joint_vel": [], "box_state": [], "box_offset": []}
+    tried = accepted = 0
+    for batch in range(ARGS.max_random_batches):
+        offset = torch.zeros(count, 3, device=device)
+        offset[:, :2] = ranges[:, 0] + torch.rand(count, 2, device=device) * (ranges[:, 1] - ranges[:, 0])
+        start = bowl_state_local[:, :7].to(device).expand(count, -1).clone()
+        start[:, :3] += env.scene.env_origins + offset
+        robot.write_joint_state_to_sim(q, torch.zeros_like(q))
+        robot.set_joint_position_target(q)
+        bowl.write_root_pose_to_sim(start)
+        bowl.write_root_velocity_to_sim(torch.zeros(count, 6, device=device))
+        for sensor in env.scene.sensors.values():
+            sensor.reset()
+        peak = {"hand": torch.zeros(count, device=device), "arm": torch.zeros(count, device=device)}
+
+        def track():
+            peak["hand"] = torch.maximum(peak["hand"], hand_box_contact_forces(env).amax(dim=-1))
+            for name in ARM_CONTACT_SENSORS:
+                peak["arm"] = torch.maximum(peak["arm"], torch.linalg.vector_norm(
+                    env.scene.sensors[name].data.net_forces_w, dim=-1).amax(dim=-1))
+
+        step_physics(env, ARGS.hold_steps, track)
+        up_start = object_up_axis(cfg.object_spec, start[:, 3:7])
+        up_end = object_up_axis(cfg.object_spec, bowl.data.root_quat_w)
+        ok = ((torch.linalg.vector_norm(bowl.data.root_pos_w - start[:, :3], dim=-1) <= ARGS.max_bowl_displacement_m)
+              & (torch.acos((up_start * up_end).sum(-1).clamp(-1.0, 1.0)) <= math.radians(ARGS.max_bowl_tilt_deg))
+              & (peak["hand"] <= ARGS.max_contact_force_n) & (peak["arm"] <= ARGS.max_contact_force_n))
+        state = bowl.data.root_state_w.clone()
+        state[:, :3] -= env.scene.env_origins
+        for key, value in (("joint_pos", robot.data.joint_pos), ("joint_vel", robot.data.joint_vel),
+                           ("box_state", state), ("box_offset", offset)):
+            kept[key].append(value[ok].clone().cpu())
+        tried += count
+        accepted += int(ok.sum())
+        if accepted >= ARGS.random_rows:
+            break
+    table = {key: torch.cat(values)[:ARGS.random_rows] for key, values in kept.items()}
+    n = len(table["joint_pos"])
+    off = table["box_offset"]
+    summary = {
+        "object": cfg.object_spec.name, "rows": n, "tried": tried, "acceptance_rate": accepted / max(tried, 1),
+        "x_range_m": list(cfg.bowl_init_x_range_m), "y_range_m": list(cfg.bowl_init_y_range_m),
+        "accepted_x_m": [round(off[:, 0].min().item(), 4), round(off[:, 0].max().item(), 4)] if n else None,
+        "accepted_y_m": [round(off[:, 1].min().item(), 4), round(off[:, 1].max().item(), 4)] if n else None,
+    }
+    print("[bowl-pivot-init] randomized: " + json.dumps(summary), flush=True)
+    output.with_suffix(".json").write_text(json.dumps(summary, indent=2))
+    if n == 0:
+        print(f"[bowl-pivot-init] no randomized start passed, nothing saved to {output}", flush=True)
+        return
+    torch.save({
+        "format_version": TABLE_FORMAT_VERSION,
+        "object_name": cfg.object_spec.name,
+        "joint_names": list(robot.joint_names),
+        **table,
+        "joint_target": q_row.cpu().expand(n, -1).clone(),
+        "backoff_m": torch.zeros(n),
+        "valid": torch.ones(n, dtype=torch.bool),
+        "meta": summary,
+    }, output)
+    print(f"[bowl-pivot-init] saved {output}", flush=True)
 
 
 def main() -> int:
@@ -254,6 +332,8 @@ def main() -> int:
             "meta": summary,
         }, output)
         print(f"[bowl-pivot-init] saved {output}", flush=True)
+        if ARGS.random_rows > 0:
+            random_table(env, cfg, q[rows], bowl_state, output.with_name(bowl_pivot_init_path(spec, True).name))
         return 0
     finally:
         env.close()

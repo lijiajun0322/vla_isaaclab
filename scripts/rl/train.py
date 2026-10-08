@@ -24,6 +24,8 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--save-interval", type=int, default=None, help="Checkpoint every N iterations (default: runner cfg).")
 parser.add_argument("--run-name", default="")
 parser.add_argument("--resume", type=Path, default=None, help="Checkpoint (.pt) to continue from.")
+parser.add_argument("--reset-action-std", type=float, default=None,
+                    help="After --resume, set the policy's action noise std to this value (e.g. it grew too large).")
 parser.add_argument("--log-root", type=Path, default=PROJECT_ROOT / "outputs/rl/runs")
 parser.add_argument("--verbose-log", action="store_true",
                     help="Also print RSL-RL's full per-iteration block (default: a short summary).")
@@ -72,6 +74,13 @@ def main() -> int:
         if ARGS.resume is not None:
             print(f"[train] resuming from {ARGS.resume}", flush=True)
             runner.load(str(ARGS.resume))
+        if ARGS.reset_action_std is not None:
+            policy = runner.alg.actor_critic
+            if getattr(policy, "noise_std_type", "scalar") == "log":
+                policy.log_std.data.fill_(float(torch.log(torch.tensor(ARGS.reset_action_std))))
+            else:
+                policy.std.data.fill_(ARGS.reset_action_std)
+            print(f"[train] action noise std reset to {ARGS.reset_action_std}", flush=True)
         dump_yaml(str(log_dir / "params/env.yaml"), env_cfg)
         dump_yaml(str(log_dir / "params/agent.yaml"), agent_cfg)
         dump_pickle(str(log_dir / "params/env.pkl"), env_cfg)

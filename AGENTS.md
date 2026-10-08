@@ -63,9 +63,15 @@ Gym ID -> EnvCfg -> Scene + Isaac Lab Managers -> normalized action -> robot
 - `envs/bowl_pivot/`: bimanual RL task `VLA-BowlPivot-G1-Bimanual-v0`: both arms
   (relative DiffIK) and both Dex3 hands turn an upside-down bowl upright, at 2/3 of
   the grasp-lift fast speed limits (`-Fast-v0`: full fast, where the policy tosses the
-  bowl; `-HalfSpeed-v0`: 1/2). One
-  fixed start state, `outputs/rl/024_bowl/bowl_pivot_init.pt`, built by
-  `./scripts/rl/build_bowl_pivot_init.sh --headless` in the pregrasp-table format.
+  bowl; `-HalfSpeed-v0`: 1/2), rewarded for keeping the rim on the table and setting
+  it down gently. Start states: `outputs/rl/024_bowl/bowl_pivot_init[_random].pt`,
+  built by `./scripts/rl/build_bowl_pivot_init.sh --headless`. Self-collision is on
+  in these tasks (`enable_g1_self_collisions`; the wrist camera brackets and
+  overlapping wrist links are filtered). `VLA-BowlPivotLift-G1-Bimanual-HalfSpeed-v0`
+  adds stages 2-3: hold the turned bowl from outside (support points beside its
+  foot; inner-wall contact penalized), lift it 5 cm level and hold it 2 s.
+  `VLA-BowlFlippedLift[-Right]-G1-v0` is the grasp-lift task from post-flip states
+  built by `./scripts/rl/build_bowl_flipped_pregrasp.sh` (hand contact allowed).
 
 Use Isaac Lab `JointPositionToLimitsActionCfg` for the 43-D normalized action.
 Its mapping is `-1=soft lower limit`, `0=midpoint`, `+1=soft upper limit`.

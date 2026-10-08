@@ -13,6 +13,7 @@ from .g1 import (
     RIGHT_END_EFFECTOR,
     RIGHT_HAND_JOINT_NAMES,
     WAIST_JOINT_NAMES,
+    enable_g1_self_collisions,
     make_g1_cfg,
 )
 from .base import VLAEnvCfg
@@ -55,6 +56,7 @@ __all__ = [
     "WAIST_JOINT_NAMES",
     "VLAEnvCfg",
     "camera_cfg",
+    "enable_g1_self_collisions",
     "g1_head_camera_cfg",
     "g1_left_wrist_camera_cfg",
     "ground_cfg",

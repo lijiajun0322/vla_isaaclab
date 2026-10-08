@@ -77,6 +77,11 @@ def bowl_center(env) -> torch.Tensor:
     return bowl.data.root_pos_w + quat_apply(bowl.data.root_quat_w, center)
 
 
+def bowl_lowest_height(env) -> torch.Tensor:
+    """Height of the bowl's lowest point above the table top, (num_envs,)."""
+    return grasp_rl.object_lowest_height(env)
+
+
 def hand_contact_forces(env, side: str) -> torch.Tensor:
     return grasp_rl.contact_forces(env, HAND_CONTACT_SENSORS[side])
 
@@ -156,14 +161,85 @@ def upright(env) -> torch.Tensor:
     return 1.0 - bowl_tilt(env) / math.pi
 
 
+def rim_on_table(env, max_height_m: float = 0.01) -> torch.Tensor:
+    """The bowl's lowest point within max_height_m of the table: it pivots on its rim, not in the air."""
+    return bowl_lowest_height(env) < max_height_m
+
+
 def tilt_progress(env) -> torch.Tensor:
-    """Pays only when the bowl turns further toward upright than ever before this episode.
+    """Pays only when the bowl turns further toward upright than ever before this episode, with its rim on the table.
 
     The grasp-lift progress reward on tilt / pi (0..1): max(best - error, 0),
     then best = min(best, error), so rocking the bowl back and forth earns
-    nothing. Needs grasp_rl.reset_grasp_progress as a reset event.
+    nothing. The best also advances while the bowl is in the air but that
+    turn is not paid, so a toss does not collect it on landing either. Needs
+    grasp_rl.reset_grasp_progress as a reset event.
     """
-    return grasp_rl._progress_on(env, "bowl_tilt", bowl_tilt(env) / math.pi)
+    return grasp_rl._progress_on(env, "bowl_tilt", bowl_tilt(env) / math.pi) * rim_on_table(env).float()
+
+
+# -- gentle turning: no flight, soft landing, no fast spin -----------------------
+
+OBJECT_TABLE_SENSOR = "object_table_contact"
+
+
+def free_flight(env, min_height_m: float = 0.01) -> torch.Tensor:
+    """1 while the bowl is off the table (lowest point above min_height_m) and neither hand touches it."""
+    untouched = ~(hand_touches_bowl(env, "left") | hand_touches_bowl(env, "right"))
+    return ((bowl_lowest_height(env) > min_height_m) & untouched).float()
+
+
+def table_impact_force(env) -> torch.Tensor:
+    """Largest bowl/table contact force over the last control step (N); 0 on an episode's first step."""
+    return grasp_rl.contact_forces(env, (OBJECT_TABLE_SENSOR,))[:, 0]
+
+
+def hard_landing(env, threshold_n: float = 3.0, scale_n: float = 20.0) -> torch.Tensor:
+    """(bowl/table force - threshold_n) / scale_n in [0, 1]; the bowl alone weighs 1.4 N."""
+    return ((table_impact_force(env) - threshold_n) / scale_n).clamp(0.0, 1.0)
+
+
+def fast_spin(env, threshold_radps: float = 4.0, scale_radps: float = 4.0) -> torch.Tensor:
+    """(bowl angular speed - threshold) / scale, 0 below the threshold (a toss spins at ~10 rad/s)."""
+    speed = torch.linalg.vector_norm(_bowl(env).data.root_ang_vel_w, dim=-1)
+    return ((speed - threshold_radps) / scale_radps).clamp(min=0.0)
+
+
+_GENTLE_ATTR = "bowl_pivot_gentle"
+
+
+def _gentle(env) -> dict[str, torch.Tensor]:
+    state = env.__dict__.get(_GENTLE_ATTR)
+    if state is None:
+        state = {"flew": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+                 "peak_impact": torch.zeros(env.num_envs, device=env.device)}
+        env.__dict__[_GENTLE_ATTR] = state
+    return state
+
+
+def reset_gentle(env, env_ids: torch.Tensor | None):
+    """Reset event: clear the episode's free-flight flag and peak landing force."""
+    ids = slice(None) if env_ids is None else env_ids
+    state = _gentle(env)
+    state["flew"][ids] = False
+    state["peak_impact"][ids] = 0.0
+
+
+def gentle_so_far(env, max_impact_n: float = 10.0) -> torch.Tensor:
+    """No free flight and no bowl/table force above max_impact_n so far this episode (updated once per step)."""
+    cache = env.__dict__.setdefault("_bowl_pivot_gentle_cache", {})
+    step = int(env.common_step_counter)
+    if cache.get("step") != step:
+        state = _gentle(env)
+        state["flew"] |= free_flight(env) > 0
+        state["peak_impact"] = torch.maximum(state["peak_impact"], table_impact_force(env))
+        cache.update(step=step, value=~state["flew"] & (state["peak_impact"] <= max_impact_n))
+    return cache["value"]
+
+
+def gentle_success(env) -> torch.Tensor:
+    """1 on the success step if the bowl was turned without flying or a hard landing."""
+    return (env.termination_manager.get_term("success") & gentle_so_far(env)).float()
 
 
 def hands_near_bowl(env, scale_m: float = 0.05) -> torch.Tensor:
@@ -236,6 +312,7 @@ def bowl_spinning(env, max_angular_speed_radps: float = 20.0) -> torch.Tensor:
 __all__ = [
     "bowl_displacement",
     "bowl_in_palms",
+    "bowl_lowest_height",
     "bowl_pose_b",
     "bowl_ran_away",
     "bowl_spinning",
@@ -244,6 +321,12 @@ __all__ = [
     "hands_contact",
     "hands_contact_force",
     "hands_near_bowl",
+    "fast_spin",
+    "free_flight",
+    "gentle_success",
+    "hard_landing",
+    "reset_gentle",
+    "rim_on_table",
     "palm_poses_b",
     "pivot_success",
     "reset_upright_streak",

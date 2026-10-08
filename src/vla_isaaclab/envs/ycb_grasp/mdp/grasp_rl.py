@@ -8,6 +8,7 @@ that start height. Object size and axes come from ``env.cfg.object_spec``.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from isaaclab.assets import Articulation, RigidObject
@@ -63,6 +64,41 @@ def _body_ids(env, names) -> list[int]:
     return cache[names]
 
 
+def _side(env) -> str:
+    """Grasping hand, cfg.grasp_side ("left" by default)."""
+    return getattr(env.cfg, "grasp_side", "left")
+
+
+def _palm_body(env) -> str:
+    return f"{_side(env)}_hand_palm_link"
+
+
+def _fingertip_bodies(env) -> tuple[str, ...]:
+    side = _side(env)
+    return (f"{side}_hand_thumb_2_link", f"{side}_hand_index_1_link", f"{side}_hand_middle_1_link")
+
+
+def _fingertip_offsets(env) -> tuple[tuple[float, float, float], ...]:
+    """FINGERTIP_OFFSETS; the right hand mirrors the left (palm/link y flipped), so its thumb points along +y."""
+    if _side(env) == "right":
+        return tuple((x, -y, z) if i == 0 else (x, y, z) for i, (x, y, z) in enumerate(FINGERTIP_OFFSETS))
+    return FINGERTIP_OFFSETS
+
+
+def _sided_sensors(env, sensors) -> tuple[str, ...]:
+    """Left-hand sensor names mapped to the right hand's (object_contact_right_*, table_contact_right_*)."""
+    if _side(env) != "right":
+        return tuple(sensors)
+    out = []
+    for name in sensors:
+        for prefix in ("object_contact_", "table_contact_"):
+            if name.startswith(prefix) and not name.startswith(prefix + "right_"):
+                name = prefix + "right_" + name[len(prefix):]
+                break
+        out.append(name)
+    return tuple(out)
+
+
 def _start_pos(env) -> torch.Tensor:
     start = getattr(env, "grasp_object_start_pos", None)
     return _object(env).data.root_pos_w if start is None else start
@@ -78,7 +114,7 @@ def contact_forces(env, sensors=HAND_CONTACT_SENSORS) -> torch.Tensor:
     forces = torch.stack(
         [
             torch.linalg.vector_norm(env.scene.sensors[name].data.force_matrix_w, dim=-1).amax(dim=(1, 2))
-            for name in sensors
+            for name in _sided_sensors(env, sensors)
         ],
         dim=-1,
     )
@@ -95,7 +131,50 @@ def grasp_flag(env) -> torch.Tensor:
     return thumb & finger
 
 
+# Object mesh vertices (root frame) for the lowest point: a fixed subsample is
+# within a few mm of the true minimum and cheap for thousands of envs.
+LOWEST_POINT_SAMPLES = 1024
+
+
+def object_points_local(env) -> torch.Tensor:
+    """Object mesh vertices in its root frame, from the spec's USD, (<= LOWEST_POINT_SAMPLES, 3); cached."""
+    points = env.__dict__.get("_object_points_local")
+    if points is None:
+        from pxr import Usd, UsdGeom
+
+        stage = Usd.Stage.Open(_spec(env).usd_path)
+        cache = UsdGeom.XformCache()
+        root = stage.GetDefaultPrim()
+        to_root = cache.GetLocalToWorldTransform(root).GetInverse()
+        parts = []
+        for prim in Usd.PrimRange(root):
+            if prim.IsA(UsdGeom.Mesh):
+                local = torch.from_numpy(np.asarray(UsdGeom.Mesh(prim).GetPointsAttr().Get(), dtype=np.float64))
+                matrix = torch.from_numpy(np.asarray(cache.GetLocalToWorldTransform(prim) * to_root, dtype=np.float64))
+                parts.append(torch.cat((local, torch.ones(len(local), 1, dtype=torch.float64)), -1) @ matrix)
+        points = torch.cat(parts)[:, :3].float()
+        if len(points) > LOWEST_POINT_SAMPLES:
+            points = points[torch.randperm(len(points), generator=torch.Generator().manual_seed(0))[:LOWEST_POINT_SAMPLES]]
+        points = points.to(env.device)
+        env.__dict__["_object_points_local"] = points
+    return points
+
+
+def object_lowest_height(env) -> torch.Tensor:
+    """Height of the object's lowest point above the table top, (num_envs,)."""
+    obj = _object(env)
+    points = object_points_local(env)
+    count = points.shape[0]
+    quat = obj.data.root_quat_w.unsqueeze(1).expand(-1, count, -1).reshape(-1, 4)
+    world_z = quat_apply(quat, points.repeat(env.num_envs, 1))[:, 2].reshape(env.num_envs, count)
+    return world_z.amin(dim=-1) + obj.data.root_pos_w[:, 2] - _spec(env).support_height_m
+
+
 def lift_height(env) -> torch.Tensor:
+    """Root rise above the start, or, with cfg.lift_from_lowest_point, the lowest point's height above the table
+    (a tipped bowl raises its root without leaving the table)."""
+    if getattr(env.cfg, "lift_from_lowest_point", False):
+        return object_lowest_height(env)
     return _object(env).data.root_pos_w[:, 2] - _start_pos(env)[:, 2]
 
 
@@ -112,7 +191,7 @@ def object_tilt(env) -> torch.Tensor:
 def fingertips_in_object(env) -> torch.Tensor:
     """Fingertip link positions in the object frame, (num_envs, 3, 3)."""
     obj = _object(env)
-    tips = _robot(env).data.body_pos_w[:, _body_ids(env, FINGERTIP_BODIES)]
+    tips = _robot(env).data.body_pos_w[:, _body_ids(env, _fingertip_bodies(env))]
     count = tips.shape[1]
     quat = quat_conjugate(obj.data.root_quat_w).unsqueeze(1).expand(-1, count, -1).reshape(-1, 4)
     local = quat_apply(quat, (tips - obj.data.root_pos_w.unsqueeze(1)).reshape(-1, 3))
@@ -127,9 +206,9 @@ FINGERTIP_OFFSETS = ((0.0, -0.045, 0.0), (0.045, 0.0, 0.0), (0.045, 0.0, 0.0))
 def fingertip_points_in_object(env) -> torch.Tensor:
     """Actual fingertip points (not link origins) in the object frame, (num_envs, 3, 3)."""
     robot, obj = _robot(env), _object(env)
-    ids = _body_ids(env, FINGERTIP_BODIES)
+    ids = _body_ids(env, _fingertip_bodies(env))
     pos, quat = robot.data.body_pos_w[:, ids], robot.data.body_quat_w[:, ids]
-    offsets = pos.new_tensor(FINGERTIP_OFFSETS).expand_as(pos)
+    offsets = pos.new_tensor(_fingertip_offsets(env)).expand_as(pos)
     tips = pos + quat_apply(quat.reshape(-1, 4), offsets.reshape(-1, 3)).reshape(pos.shape)
     count = tips.shape[1]
     inv = quat_conjugate(obj.data.root_quat_w).unsqueeze(1).expand(-1, count, -1).reshape(-1, 4)
@@ -151,7 +230,7 @@ def fingertip_surface_gaps(env) -> torch.Tensor:
 
 def palm_pose_b(env) -> torch.Tensor:
     robot = _robot(env)
-    palm = _body_ids(env, (PALM_BODY,))[0]
+    palm = _body_ids(env, (_palm_body(env),))[0]
     pos, quat = subtract_frame_transforms(
         robot.data.root_pos_w, robot.data.root_quat_w, robot.data.body_pos_w[:, palm], robot.data.body_quat_w[:, palm]
     )
@@ -161,7 +240,7 @@ def palm_pose_b(env) -> torch.Tensor:
 def object_pose_in_palm(env) -> torch.Tensor:
     robot = _robot(env)
     obj = _object(env)
-    palm = _body_ids(env, (PALM_BODY,))[0]
+    palm = _body_ids(env, (_palm_body(env),))[0]
     pos, quat = subtract_frame_transforms(
         robot.data.body_pos_w[:, palm], robot.data.body_quat_w[:, palm], obj.data.root_pos_w, obj.data.root_quat_w
     )
@@ -341,7 +420,7 @@ def goal_pose_in_object(env) -> torch.Tensor:
 def object_palm_relative_speed(env) -> torch.Tensor:
     """Object speed relative to the palm, as if rigidly attached to the palm at its current spot."""
     robot, obj = _robot(env), _object(env)
-    palm = _body_ids(env, (PALM_BODY,))[0]
+    palm = _body_ids(env, (_palm_body(env),))[0]
     carried = robot.data.body_lin_vel_w[:, palm] + torch.cross(
         robot.data.body_ang_vel_w[:, palm], obj.data.root_pos_w - robot.data.body_pos_w[:, palm], dim=-1
     )
@@ -379,7 +458,7 @@ def dextrah_to_object(env) -> torch.Tensor:
     if _spec(env).rim_radius_m > 0.0:
         distance = torch.linalg.vector_norm(fingertip_rim_distances(env), dim=-1)
     else:
-        tips = _robot(env).data.body_pos_w[:, _body_ids(env, FINGERTIP_BODIES)]
+        tips = _robot(env).data.body_pos_w[:, _body_ids(env, _fingertip_bodies(env))]
         distance = torch.linalg.vector_norm((tips - _object(env).data.root_pos_w.unsqueeze(1)).flatten(1), dim=-1)
     return _progress_on(env, "to_object", distance)
 
@@ -395,9 +474,12 @@ def hand_closure(env) -> torch.Tensor:
     """Progress on the summed hand-joint distance to the closed pose, until thumb and a finger touch."""
     cache = env.__dict__.setdefault("_grasp_rl_hand_joints", {})
     if "ids" not in cache:
-        ids, _ = _robot(env).find_joints(list(LEFT_HAND_JOINT_NAMES), preserve_order=True)
+        # The right hand closes in the mirrored direction (its joint limits are the left's negated).
+        side, mirror = _side(env), (-1.0 if _side(env) == "right" else 1.0)
+        names = [name.replace("left_", f"{side}_", 1) for name in LEFT_HAND_JOINT_NAMES]
+        ids, _ = _robot(env).find_joints(names, preserve_order=True)
         cache["ids"] = ids
-        cache["closed"] = torch.tensor(LEFT_HAND_CLOSED_JOINT_POSITIONS, device=env.device)
+        cache["closed"] = torch.tensor(LEFT_HAND_CLOSED_JOINT_POSITIONS, device=env.device) * mirror
     error = (_robot(env).data.joint_pos[:, cache["ids"]] - cache["closed"]).abs().sum(dim=-1)
     return _progress_on(env, "hand_closure", error, active=~grasp_flag(env))
 

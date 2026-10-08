@@ -70,11 +70,12 @@ HAND_LINKS = {
 }
 
 
-def add_hand_table_contacts(scene) -> None:
-    """One table_contact_<link> sensor per hand link, filtered to the table top."""
+def add_hand_table_contacts(scene, side: str = "left") -> None:
+    """One table_contact_<link> sensor per hand link (table_contact_right_<link> for the right hand), filtered to the table top."""
     for short, link in HAND_LINKS.items():
-        setattr(scene, f"table_contact_{short}", ContactSensorCfg(
-            prim_path=f"{{ENV_REGEX_NS}}/Robot/{link}",
+        name = f"table_contact_{short}" if side == "left" else f"table_contact_right_{short}"
+        setattr(scene, name, ContactSensorCfg(
+            prim_path=f"{{ENV_REGEX_NS}}/Robot/{link.replace('left_', f'{side}_', 1)}",
             filter_prim_paths_expr=["{ENV_REGEX_NS}/SupportSurface"],
             history_length=4,
         ))
